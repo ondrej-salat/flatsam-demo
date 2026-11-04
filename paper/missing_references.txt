@@ -1,8 +1,0 @@
-References intentionally not added to sjo-bib.bib:
-
-- LoMa / LoMaR local feature matcher: bibliography key and publication details needed.
-
-Reference associations to confirm before submission:
-
-- POIC dataset is currently cited as alismail2016robust.
-- SAM3 currently uses carion2025sam (arXiv entry already present in sjo-bib.bib).

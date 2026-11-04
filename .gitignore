@@ -1,39 +1,15 @@
 # Python
 __pycache__/
 *.py[cod]
-*.so
+*.egg-info/
 
-# Virtual env
+# environment (setup.sh)
 venv/
 .env
-
-# Pyproject/build
-dist/
-build/
-*.egg-info/
-/.dir-locals.el
-/Makefile
-
 .envrc
 
 # demo outputs + local datasets (.env defaults)
 /results/
 /vis/
 /data/
-
-# SLURM
-slurm/logs/*.out
-slurm/logs/*.err
-slurm/logs/*
-slurm/tmp/*.txt
-/.claude/
-
-/checkpoints/
-/.agent-shell/
-/analysis
-/.codex
-/docs/correction_findings_report.pdf
-
-# IDE settings and local demo videos
-/.idea/
 *.mp4

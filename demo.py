@@ -1,11 +1,10 @@
-"""FlatSAM2 demo: track one dataset sequence or your own video, locally or on SLURM.
+"""FlatSAM2 demo: track one dataset sequence or your own video.
 
 All paths/logins come from .env (copy .env.example). Examples:
 
     python demo.py dataset                         # DEMO_DATASET / DEMO_SEQUENCE from .env
     python demo.py dataset pot V24_3
     python demo.py video clip.mp4 --corners x1 y1 x2 y2 x3 y3 x4 y4
-    python demo.py dataset pot V24_3 --slurm       # GPU node: sbatch here, else ssh HPC_HOST
     python demo.py params                          # list every tunable key + current value
     python demo.py dataset pot V24_3 --set loma.inlier_threshold=40 --set symmetry.match_tau_px=20
 """
@@ -15,7 +14,6 @@ import ast
 import hashlib
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -138,26 +136,6 @@ def demo_video(args: argparse.Namespace) -> None:
     print(f"video: {out_path}")
 
 
-def submit_slurm(argv: list[str]) -> None:
-    """Re-run this same demo command on a GPU node via slurm/submit_cmd.py."""
-    inner = [a for a in argv if a != "--slurm"]
-    # one sequence ≈ 5 min: a small, short job on the fast partition starts sooner
-    submit = ["python", "slurm/submit_cmd.py", "--gpus", "1",
-              "--partition", os.environ.get("DEMO_SLURM_PARTITION", "amdgpufast"),
-              "--time", os.environ.get("DEMO_SLURM_TIME", "00:30:00"),  # must stay <= 4 h on *fast
-              "--mem", os.environ.get("DEMO_SLURM_MEM", "16G"),
-              "--job-name", "flatsam2-demo", "--", "python", "demo.py", *inner]
-    if shutil.which("sbatch"):
-        run(submit)
-        return
-    # shortcut: assumes the HPC repo is already synced (make sjo_sync) and a video path exists there
-    host = os.environ.get("HPC_HOST")
-    if not host:
-        sys.exit("no sbatch here and HPC_HOST not set in .env")
-    repo = os.environ.get("HPC_REPO", "~/git/flatsam2")
-    run(["ssh", host, f"cd {repo} && source .envrc && {shlex.join(submit)}"])
-
-
 def main() -> None:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", type=Path,
@@ -166,7 +144,6 @@ def main() -> None:
                         help="Base tracker config (default: DEMO_CONFIG from .env).")
     common.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                         help="Override one config value, repeatable; keys from `params`.")
-    common.add_argument("--slurm", action="store_true", help="Run on a SLURM GPU node.")
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -189,9 +166,7 @@ def main() -> None:
     sub.add_parser("params", parents=[common], help="List tunable config keys and values.")
 
     args = parser.parse_args()
-    if args.slurm and args.mode != "params":
-        submit_slurm(sys.argv[1:])
-    elif args.mode == "dataset":
+    if args.mode == "dataset":
         demo_dataset(args)
     elif args.mode == "video":
         demo_video(args)

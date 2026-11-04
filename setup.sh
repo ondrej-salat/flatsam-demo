@@ -50,7 +50,8 @@ if [ -z "${HF_TOKEN:-}" ] && [ ! -s "$TOKEN_FILE" ]; then
     unset T
 fi
 venv/bin/python -c "from sam3.model_builder import download_ckpt_from_hf as d; print('SAM3', d(version='sam3'))"
-venv/bin/python -c "from loma import LoMa, LoMaR; LoMa(LoMaR()); print('LoMa weights ok')"
+# CPU on purpose: only fetches the weights, so a busy/absent GPU does not matter
+CUDA_VISIBLE_DEVICES= venv/bin/python -c "from loma import LoMa, LoMaR; LoMa(LoMaR()); print('LoMa weights ok')"
 
 # --- smoke test: config loads (CPU, seconds) --------------------------------------------
 venv/bin/python demo.py params > /dev/null || { echo "ERROR: config smoke check failed (see above)"; exit 1; }

@@ -1,0 +1,564 @@
+We have segmentation tracker that produces long-term stable and usually high-quality binary segmentation masks of the target object. Independently we are also tracking the flat target with a homography pose estimation. We wan't to be able to score and explain / validate homography poses during this to identify target lost, need of re-detection, or compare multiple homography hypotheses.
+
+Main idea: mask A in the initial frame warped with the homography in question to the current frame should align well with the mask B provided in the current frame by the segmentation tracker. Explainable consistency (/inconsistency) of the two outputs is what we are after.
+
+Consider using distance transform on the masks, or perhaps more efficient list of contour points (extracted e.g. by findContours from opencv or some other way).
+Idea: not all boundary points are equal - a corner or some uniquely shaped part of the boundary provides much stronger signal about the estimate correctness / incorrectness than a not-perfectly-unique straight edge (but a perfect alignment of a long edge is also a strong positive signal).
+
+We may keep some form of history so that we can distinguish relatively slow / continual occlusion from genuinly incorrect sudden homography errors. Idea: we could split the mask A boundary into N parts, keep history of the visibility / some metrics of those and do some smart thing about that.
+
+The whole scoring / validation does not have to produce a single number. Above all it must be well explainable. It should be possible to e.g. create a visualization that shows the two masks, marking the parts that do / don't overlap perfectly and what was the explanation used / how it counted into the final assesment.
+
+(It should run reasonably fast - aiming for real-time speeds ultimately, but now lets focus more on the correctness than raw speed. Making the whole thing (at least partially) differentiable w.r.t. homography params would be a nice bonus)
+
+The method should be able to handle those typical scenarios (feel free to come up with other important scenarios)
+
+Example scenarios:
+E1) perfect alignment - both masks overlap near-perfectly
+-> absolute confidence that the homography is correct
+
+E2) no overlap of the masks
+-> absolute confidence that the homography is incorrect (lets assume that the segmentation is ok for now)
+
+E3) part of the segmentation mask B not explained by the homography - due to a tracking error, the segmenter starts segmenting more than just the target, adding a possibly long narrow appendix to the true mask.
+-> most of the mask matches well, so high confidence that the homography is correct + identification of parts of the segmentation mask B that are possibly incorrect (so that the segmentation tracker can be later informed and corrected).
+
+E4) part of the warped segmentation mask A not explained by the current estimate mask B - due to partial occlusion (can be very high fraction of the object, maybe only 5% is still visible - should keep working almost until the full occlusion if possible) the estimated mask B does not cover the whole target object, but only its visible part, but the warped initial mask A covers the whole object (amodal segmentation).
+-> possibly still high confidence, depending on the quality of the match on the visible parts and the extent of these. Also identification of the occlusion mask. We must be able to distinguish a genuinely bad alignment from a "bad alignment" only due to occlusions. When only tiny part of the object is visible, the confidence must be very low. When some distinguishable parts of the boundary are visible and well aligned, the confidence can be quite high even when e.g. the center of the object is fully occluded.
+
+E5) any of the above, but with slightly imprecise homography and/or segmentation mask estimate
+-> The boundaries do not match perfectly, but the alignment is there to some extent. A human would say it is aligned correctly, but not very precisely. Our overall assesment of the situation should not dramatically change, but the imprecission should be reflected in some score that gets worse as the noise gets larger.
+
+E6) object going partially out of frame - similar to E4, but with known cause
+-> easy to identify (segmentation mask B touching the frame boundaries), should be explained consistently (e.g. if everything visible matches perfectly with the warp, then it doesn't matter that much that (known, identified) parts are out of view).
+
+E7) given three homography pose candidates X, Y, Z, with X being almost perfect, the Y being slightly imprecise (a human would consider the pose almost correct) and the Z being grossly incorrect
+-> the method should output info such that this comparison can be made (filter Z out as grossly incorrect, mark X and Y ok, but X being the better one), i.e. not just binary good / bad, but some score/s that can be compared
+
+==== Agent notes, comments, remarks, proposals ====
+
+----------------------------------------------------------------------
+## Remaining questions / observations on the spec
+----------------------------------------------------------------------
+
+1. B can touch the frame edge in two distinct situations: (a) the object
+   genuinely extends past the frame edge (E6), or (b) the segmenter mask
+   happens to reach the edge due to error (E3-like). We can heuristically
+   distinguish these: if a contiguous chunk of ∂B runs exactly along the
+   image border, it's almost certainly a frame clip (E6). If only a thin
+   appendix pokes the border, it's more likely E3. The algorithm should
+   label border-touching ∂B segments separately so downstream logic can
+   decide.
+
+3. Masks may have multiple connected components (e.g., segmenter occasionally
+   produces stray blobs, or occlusion splits visible region into two pieces).
+   The algorithm should handle this naturally — contours are extracted per
+   component, everything is per-point, so this just works. But the segment
+   decomposition (Phase 4) should be per-contour, not trying to merge across
+   disconnected contours.
+
+----------------------------------------------------------------------
+## Proposed algorithm
+----------------------------------------------------------------------
+
+### Core insight: asymmetric boundary classification
+
+The relationship between A' (warped reference mask) and B (current
+segmentation mask) is fundamentally asymmetric:
+
+  ∂A' point outside B        → likely occluded (B is modal, doesn't see it)
+  ∂A' point deep inside B    → B is larger than A' here (segmenter excess / E3)
+  ∂A' point near ∂B          → aligned → evidence that H is correct
+
+  ∂B point outside A'        → segmenter excess or homography error
+  ∂B point deep inside A'    → occlusion edge (B "cuts into" A')
+  ∂B point near ∂A'          → aligned
+
+This six-way classification is the foundation of both the explanation and
+the confidence score.
+
+### Phase 0: Precomputation (once per reference mask)
+
+Done once when the target is initialized:
+
+  - Extract ∂A as ordered contour points of mask_A, sampled at uniform
+    arc-length spacing (e.g. every ~2px along the boundary).
+  - Compute curvature κ[i] at each contour point using finite differences
+    on the contour (tangent angle change over arc length). Smooth lightly
+    first to suppress discretization noise.
+  - Assign each point a distinctiveness weight:
+        w[i] = 1 + α · |κ[i]|
+    (α tunable; a value around 5–20 is a reasonable starting range, but
+    needs empirical tuning on real data).
+  - These points, their ordering, curvature, and weights are fixed for the
+    lifetime of the target.
+
+### Phase 1: Per-frame setup
+
+Inputs per frame:
+  - mask_B: binary mask in current frame
+  - H: candidate homography (initial → current)
+  - image_shape: (H_img, W_img)
+
+Compute:
+  a) Warp the reference contour points: p'_i = H · p_i (homogeneous
+     division). This is the ∂A' contour in the current frame. Crucially,
+     we never rasterize & re-extract — the point identity, ordering,
+     curvature and weights are preserved exactly from Phase 0.
+
+  b) For out-of-frame handling: mark each p'_i as OUT_OF_FRAME if it falls
+     outside [0, W_img) × [0, H_img). These points are excluded from all
+     further scoring (they are explained — we know why they don't match).
+
+  c) Compute unsigned distance transform of mask_B → UDT_B (distance of
+     every pixel to the nearest boundary pixel of B). Also compute a
+     "signed" version: SDF_B = UDT_B where outside B, -UDT_B where inside.
+     (cv2.distanceTransform on B and on ~B, then combine.)
+
+  d) Extract ∂B contour points (similarly sampled). Compute UDT_A' and
+     SDF_A' from the rasterized A'. (For ∂B classification only; ∂A'
+     classification uses SDF_B from step c.)
+
+     Alternative to rasterizing A': we already have the ∂A' polyline, so
+     SDF_A' can be computed analytically from point-to-polygon-boundary
+     distance + inside/outside test. For now, rasterizing is simpler and
+     fast enough.
+
+  e) For ∂B: mark points as FRAME_EDGE if they lie within 1px of the
+     image border. These are candidates for E6 (out-of-frame clipping).
+
+### Phase 2: Boundary point classification
+
+For each in-frame point p'_i on ∂A':
+
+  d_boundary = UDT_B(p'_i)       # unsigned dist to nearest ∂B
+  d_signed   = SDF_B(p'_i)       # positive outside B, negative inside B
+
+  # Soft alignment score (Gaussian profile around boundary):
+  s_aligned  = exp(-d_boundary² / σ²)
+
+  # Residual split between occluded (outside B) vs interior (inside B):
+  s_occluded = (1 - s_aligned) · sigmoid( d_signed / τ )
+  s_interior = (1 - s_aligned) · sigmoid(-d_signed / τ )
+
+  # These three sum to 1 (by construction).
+
+Symmetrically for each non-FRAME_EDGE point q_j on ∂B:
+
+  d_boundary = UDT_A'(q_j)
+  d_signed   = SDF_A'(q_j)
+
+  s_aligned   = exp(-d_boundary² / σ²)
+  s_excess    = (1 - s_aligned) · sigmoid( d_signed / τ )   # outside A'
+  s_occl_edge = (1 - s_aligned) · sigmoid(-d_signed / τ )   # inside A'
+
+Parameters:
+  σ — alignment tolerance. Should scale with object size:
+      σ = σ_rel · sqrt(area_A)       (σ_rel ≈ 0.02..0.04)
+      For a 500×500 object → σ ≈ 10..20 px.
+  τ — inside/outside transition sharpness. τ = σ/3 is reasonable (makes
+      the sigmoid transition narrower than the alignment Gaussian).
+
+NOTE on d_boundary vs |d_signed|: For the alignment score we specifically
+want distance to the *boundary* of B, not just the absolute value of the
+signed distance. For a binary mask, UDT_B = |SDF_B|, so they're the same.
+This is worth noting because if we ever move to soft masks, they diverge.
+
+### Phase 3: Curvature-weighted aggregation
+
+Aggregate over ∂A' (excluding OUT_OF_FRAME points):
+
+  W_total       = Σ_i w[i]
+  frac_aligned  = Σ_i w[i] · s_aligned(p'_i)  / W_total
+  frac_occluded = Σ_i w[i] · s_occluded(p'_i) / W_total
+  frac_interior = Σ_i w[i] · s_interior(p'_i) / W_total
+  frac_oof      = (# out-of-frame points · mean(w)) / (W_total + those)
+
+  # Alignment precision — how close are the aligned parts?
+  mean_align_dist = Σ_i [w[i]·s_aligned(p'_i)·d_boundary(p'_i)]
+                    / Σ_i [w[i]·s_aligned(p'_i)]
+  # (if no points are aligned, this is undefined → set to +∞)
+
+Aggregate over ∂B (excluding FRAME_EDGE points):
+
+  frac_aligned_B  = Σ_j s_aligned(q_j)   / N_B
+  frac_excess_B   = Σ_j s_excess(q_j)    / N_B
+  frac_occl_edge_B = Σ_j s_occl_edge(q_j) / N_B
+
+### Phase 4: Spatial explanation
+
+Group consecutive ∂A' points with the same dominant class (argmax of their
+three soft scores) into segments. Each segment S_k stores:
+
+  - class:           ALIGNED / OCCLUDED / INTERIOR / OUT_OF_FRAME
+  - point_indices:   [i_start .. i_end]
+  - arc_length:      sum of inter-point distances within the segment
+  - total_weight:    Σ w[i] over the segment's points
+  - mean_distance:   mean d_boundary for ALIGNED segments
+  - representative:  midpoint location (for visualization labels)
+
+Same for ∂B segments (ALIGNED / EXCESS / OCCL_EDGE / FRAME_EDGE).
+
+This is the full spatial explanation. Visualization: draw each segment in
+its class color on top of the image.
+
+### Phase 5: Confidence score
+
+The confidence answers: "how likely is this homography correct, given the
+mask evidence?"
+
+Two components:
+
+  1) evidence: how much of ∂A' is accounted for (aligned + explained)?
+     Curvature-weighted aligned fraction, but also accounting for the fact
+     that occluded and out-of-frame parts are *explained* (not contradictory):
+
+       frac_contradictory = frac_interior
+           (∂A' points deep inside B = B is bigger than expected =
+            either segmenter error or H error. Mildly negative signal.)
+
+       frac_supportive = frac_aligned
+           (direct positive evidence)
+
+       frac_neutral = frac_occluded + frac_oof
+           (explained away — not positive, not negative)
+
+     We want confidence to be driven by frac_supportive, penalized by
+     frac_contradictory, and gracefully degrading as frac_neutral grows
+     (less evidence, not counter-evidence).
+
+  2) precision: how tightly do the aligned parts match?
+
+       precision = exp(-mean_align_dist² / σ²)
+
+  Proposed formula:
+
+     # Raw confidence from boundary evidence
+     raw = frac_supportive · precision
+
+     # Penalty for contradictory evidence (∂A' deep inside B)
+     raw -= γ · frac_contradictory    (γ ≈ 0.5; contradictory is bad but
+                                       not as decisive as positive evidence)
+     raw = clamp(raw, 0, 1)
+
+     # Reduce confidence when too little boundary is visible to judge.
+     # Key: weight by *curvature* of the supportive segments, not just
+     # their count. A visible corner is worth more than a visible edge.
+
+     curvature_evidence = (total w[i]·s_aligned of aligned points)
+                          / (total w[i] of all ∂A' points, incl. oof)
+
+     # Below some minimum curvature evidence threshold, taper to zero:
+     min_evidence = 0.05   (tunable; below this we know almost nothing)
+     evidence_factor = clamp((curvature_evidence - min_evidence)
+                             / (1 - min_evidence), 0, 1)
+
+     confidence = raw · evidence_factor
+
+  Walk-through on each scenario:
+
+  E1 (perfect alignment):
+    frac_supportive ≈ 1, precision ≈ 1, no contradictory, full curvature
+    → confidence ≈ 1.0  ✓
+
+  E2 (no overlap):
+    frac_supportive ≈ 0 → raw ≈ 0 → confidence ≈ 0  ✓
+
+  E3 (segmenter appendix):
+    ∂A' mostly aligned (frac_supportive high), some ∂A' points may be
+    INTERIOR (inside the appendix of B — but these would be near ∂B of
+    the appendix, so actually ALIGNED if the appendix grows *from* the
+    true boundary). The contradictory fraction stays low. Meanwhile,
+    frac_excess_B is high → explanation flags the appendix.
+    → confidence high  ✓
+
+  E4 (occlusion, say 30% visible):
+    frac_supportive ≈ 0.30, frac_occluded ≈ 0.70, precision high.
+    raw ≈ 0.30. curvature_evidence depends on *which* 30% is visible.
+    - If the visible 30% includes two corners: curvature_evidence is
+      disproportionately high (say 0.5 of total weight) → confidence
+      moderate-to-good ≈ 0.30 · 1.0 · ~0.53 ≈ 0.16... hmm, that
+      seems too low.
+
+  ** Revised thinking on confidence for occlusion cases: **
+
+  The problem: raw = frac_supportive ≈ 0.30 even if that 30% matches
+  *perfectly*. But a human looking at 30% of the boundary perfectly
+  aligned (including corners) would be fairly confident. The issue is
+  that frac_supportive penalizes for the amount of boundary that *could
+  have been visible but isn't*, which is not fair under occlusion.
+
+  Better decomposition: among the points that *could* provide evidence
+  (i.e., not occluded and not out-of-frame), what fraction is aligned?
+
+     visible_points = {p'_i : s_occluded(p'_i) < 0.5 and not OUT_OF_FRAME}
+     visible_frac_aligned = (Σ w[i]·s_aligned over visible_points)
+                            / (Σ w[i] over visible_points)
+
+  This is: "of the boundary that we can actually see, how much aligns?"
+  Under occlusion with good H, this is ≈ 1.0 even if only 30% is visible.
+
+  Then confidence becomes:
+
+     quality = visible_frac_aligned · precision
+         (how good is the match on what we CAN see?)
+
+     amount  = curvature_evidence
+         (how much distinctive boundary CAN we see?)
+
+     confidence = quality · f(amount)
+
+  where f(amount) is a function that:
+    - Gives ~1.0 when amount is large (plenty of evidence, E1)
+    - Degrades smoothly toward 0 as amount shrinks
+    - Does not hit 0 until amount is truly negligible
+    - A sigmoid-like or sqrt-like curve:
+        f(x) = clamp(x / x_sufficient, 0, 1)
+      where x_sufficient ≈ 0.15 (if ≥15% of the curvature-weighted
+      boundary is visible and aligned, that's "sufficient evidence")
+
+  Re-checking E4 (30% visible, good alignment, includes corners):
+    visible_frac_aligned ≈ 1.0 (everything visible aligns)
+    precision ≈ 1.0
+    quality ≈ 1.0
+    curvature_evidence ≈ 0.5 (corners are in the visible 30%)
+    f(0.5) = 1.0 (well above threshold)
+    → confidence ≈ 1.0  ✓  (a human would also be fairly confident)
+
+  E4 (5% visible, only a featureless straight edge):
+    visible_frac_aligned ≈ 1.0
+    quality ≈ 1.0
+    curvature_evidence ≈ 0.02 (almost no curvature weight in 5% edge)
+    f(0.02) ≈ 0.13
+    → confidence ≈ 0.13  ✓  (low — too little distinctive evidence)
+
+  E4 (5% visible, but it's a sharp corner):
+    curvature_evidence ≈ 0.08 (corner has high weight)
+    f(0.08) ≈ 0.53
+    → confidence ≈ 0.53  ✓  (moderate — small but distinctive)
+
+  E5 (imprecise alignment, otherwise E1-like):
+    visible_frac_aligned ≈ 0.9 (some points slip to OCCLUDED/INTERIOR
+    due to noise, but most still within σ)
+    precision ≈ exp(-(5px)² / (10px)²) ≈ 0.78  (if σ=10, mean_dist=5)
+    quality ≈ 0.9 · 0.78 ≈ 0.70
+    curvature_evidence ≈ 0.85
+    → confidence ≈ 0.70  ✓  (good but noticeably worse than E1)
+
+  E6 (out of frame):
+    OUT_OF_FRAME points are excluded. Remaining points scored normally.
+    If the visible-in-frame part aligns well → confidence driven by
+    that part's quality and amount. Frame exit is marked in explanation
+    but doesn't count against the homography.  ✓
+
+  E7 (hypothesis comparison X vs Y vs Z):
+    X: confidence ≈ 0.98 (near-perfect)
+    Y: confidence ≈ 0.70 (imprecise)
+    Z: confidence ≈ 0.02 (wrong)
+    Ordinal ranking works: X > Y >> Z  ✓
+    Additionally, mean_align_dist gives finer separation between X and Y
+    even if both have high frac_supportive.
+
+  ** Final confidence formula (revised): **
+
+     # 1. Determine which ∂A' points are "visible" (not occluded, not oof)
+     visible_mask[i] = (s_occluded(p'_i) < 0.5) and (not OUT_OF_FRAME[i])
+
+     # 2. Quality: among visible boundary, how well does it align?
+     W_vis = Σ w[i] · visible_mask[i]
+     vis_aligned = Σ w[i] · s_aligned(p'_i) · visible_mask[i] / W_vis
+     precision   = exp(-mean_align_dist² / σ²)
+     quality     = vis_aligned · precision
+
+     # 3. Distinctiveness of visible evidence
+     curvature_evidence = W_vis_aligned / W_total_all
+       where W_vis_aligned = Σ w[i]·s_aligned(p'_i)·visible_mask[i]
+             W_total_all   = Σ w[i]  (all points including oof)
+
+     # 4. Evidence sufficiency (sigmoid-ish)
+     sufficiency = clamp(curvature_evidence / evidence_threshold, 0, 1)
+
+     # 5. Contradictory penalty
+     vis_contradictory = Σ w[i]·s_interior(p'_i)·visible_mask[i] / W_vis
+     penalty = γ · vis_contradictory
+
+     # 6. Final
+     confidence = clamp(quality - penalty, 0, 1) · sufficiency
+
+### Phase 6: Explanation output struct
+
+The method returns a rich struct, not just a number:
+
+  HomographyExplanation:
+    # Scalar summaries
+    confidence: float              # 0..1, the main score
+    precision: float               # how tight the alignment is (in pixels)
+    frac_aligned_A: float          # curvature-weighted
+    frac_occluded_A: float
+    frac_interior_A: float
+    frac_out_of_frame_A: float
+    frac_aligned_B: float
+    frac_excess_B: float
+    frac_occl_edge_B: float
+    frac_frame_edge_B: float
+
+    # Spatial
+    segments_A: list[Segment]      # ordered segments of ∂A' with classes
+    segments_B: list[Segment]      # ordered segments of ∂B with classes
+
+    # Derived masks (for downstream use)
+    occlusion_mask: ndarray        # A' AND NOT B (if occlusion detected)
+    excess_B_mask: ndarray         # B AND NOT A' (segmenter error regions)
+
+    # For differentiable use
+    alignment_loss: float          # = -log(confidence) or similar, for
+                                   #   gradient-based H refinement
+
+### Phase 7 (optional): Temporal history
+
+Track per-segment state across frames. Each reference segment (from Phase 0)
+maintains a short history of its classification (ALIGNED/OCCLUDED/etc.) and
+alignment distance. This enables:
+
+  - Distinguishing gradual occlusion (segment-by-segment loss over time)
+    from sudden H failure (all segments lost at once).
+  - Detecting segmentation drift (aligned distance gradually increasing
+    across all segments).
+  - Providing temporal smoothing of confidence (avoid single-frame glitches
+    from segmenter noise).
+
+Implementation: a ring buffer of the last K frames' per-segment stats.
+Temporal confidence adjustment:
+
+  if (previous N frames had high confidence) and (this frame has low):
+      → suspect sudden H failure, flag for re-detection
+  if (segments disappear gradually from one spatial region over N frames):
+      → consistent with occlusion, keep trusting H
+
+----------------------------------------------------------------------
+## Discussion
+----------------------------------------------------------------------
+
+### Why SDF + boundary, not area IoU
+
+Area-based IoU fails catastrophically on E4 (occlusion): a 90%-occluded
+object has IoU ≈ 0.05, even if the visible 10% is perfectly aligned. The
+IoU number is indistinguishable from a completely wrong homography.
+
+The boundary-based approach avoids this because it can recognize that the
+*visible* boundary aligns perfectly, even if most of the boundary is
+occluded. The per-point classification makes the explanation explicit.
+
+### Why warp contour points, not rasterize-then-extract
+
+Warping the contour points directly (Phase 1a) instead of rasterizing A'
+and then extracting contours from the rasterized mask is important:
+  - Preserves exact point identity (point #47 is the same physical point on
+    the target across all frames).
+  - Preserves curvature weights computed once in the reference frame.
+  - Avoids rasterization aliasing near the boundary.
+  - Naturally sub-pixel precise.
+  - Makes differentiability w.r.t. H trivial (just differentiate through
+    the homogeneous division).
+
+We still rasterize A' once (for SDF_A' computation for ∂B classification),
+but the ∂A' analysis works on the warped point cloud directly.
+
+### Differentiability w.r.t. H
+
+The path from H to confidence is:
+  H → warped points p'_i → bilinear lookup of SDF_B(p'_i) → soft scores
+  → weighted sums → confidence
+
+Every step is differentiable:
+  - Homogeneous warp + division: standard differentiable op
+  - Bilinear SDF lookup: differentiable (SDF is a smooth-ish field,
+    bilinear interpolation is differentiable)
+  - exp, sigmoid, weighted sums: all smooth
+
+So ∂confidence/∂H is well-defined and computable via autograd. This
+enables gradient-based refinement of H to maximize alignment.
+
+Note: the SDF_B is treated as a fixed "landscape" (no gradient through the
+mask itself). The gradient tells us "how should H change to better align
+∂A' with ∂B?" — which is exactly the homography refinement use case.
+
+### On the alignment tolerance σ
+
+σ controls what counts as "aligned". Too small → noisy (pixel-level
+discretization artifacts cause real alignments to score poorly). Too
+large → undiscriminating (can't distinguish good from mediocre H).
+
+For hypothesis comparison (E7), we want σ small enough that the precision
+score separates X (perfect) from Y (almost-correct). Suggest:
+  σ = 0.02 · sqrt(area_A),  so σ ≈ 10px for a 500×500px object.
+
+This means a 3px boundary alignment scores exp(-9/100) ≈ 0.91 (good),
+while a 10px misalignment scores exp(-100/100) ≈ 0.37 (poor), giving
+clear separation for E7.
+
+### On curvature computation
+
+Curvature is computed on the reference contour (smooth, stable). Method:
+  κ[i] = dθ/ds where θ is the tangent angle and s is arc length.
+Discrete version:
+  tangent[i] = (p[i+1] - p[i-1]) / |p[i+1] - p[i-1]|
+  θ[i] = atan2(tangent[i].y, tangent[i].x)
+  κ[i] = (θ[i+1] - θ[i]) / (arc_length[i] to arc_length[i+1])
+
+Smooth with a small Gaussian kernel first (σ_smooth ≈ 3-5 points) to
+suppress noise. The result is a per-point curvature that is high at corners
+and low on straight edges.
+
+### E3 detail: appendix detection
+
+When the segmenter adds an appendix to B, what happens to ∂A' points near
+the appendix? The appendix grows outward from the true boundary of B. So:
+  - ∂A' points near the base of the appendix: still ALIGNED (the appendix
+    shares the true boundary at its base).
+  - ∂A' points far from the appendix: ALIGNED (unaffected).
+  - The appendix adds new ∂B points that are classified EXCESS (outside A').
+
+So E3 is detected primarily through the ∂B-side analysis: frac_excess_B
+is elevated. The ∂A' side is mostly unaffected. The excess ∂B segments
+spatially identify where the appendix is. This is correct and useful for
+feeding back to the segmenter.
+
+### Potential failure modes / edge cases
+
+1. Very small objects (< 50px boundary): few contour points, curvature
+   estimation is noisy, all metrics become high-variance. May need a
+   minimum object size threshold below which we report "insufficient data"
+   rather than a confidence score.
+
+2. Nearly circular objects: all curvature is ~constant, no distinctive
+   features. The curvature weighting degenerates to uniform weighting.
+   This is fine — it just means we can't get high confidence under heavy
+   occlusion (no distinctive parts to anchor to), which is correct.
+
+3. Very thin elongated objects: boundary consists of two long parallel
+   edges + two small ends. Occlusion from one side could eliminate one
+   entire edge, leaving only straight boundary. Should handle fine under
+   the framework — it's just the low-curvature-evidence case.
+
+4. Concave shapes and self-occlusion: the contour might have concavities
+   where a nearby occluder's boundary runs "parallel" to the object's
+   boundary. The SDF-based classification should handle this correctly as
+   long as the occluder doesn't produce a new ∂B that's confusingly close
+   to ∂A' — but that would genuinely be an ambiguous situation.
+
+----------------------------------------------------------------------
+## Summary
+----------------------------------------------------------------------
+
+Extract reference contour ∂A with curvature weights once at initialization.
+Per frame: warp ∂A by H to get ∂A'; mark out-of-frame points; compute
+SDF_B from the segmentation mask. Classify each ∂A' point as ALIGNED /
+OCCLUDED / INTERIOR using soft differentiable thresholds on SDF_B.
+Symmetrically classify ∂B points against A'. Aggregate curvature-weighted
+fractions. Compute confidence as quality-of-visible-boundary (alignment
+fraction among non-occluded points × precision) scaled by
+distinctiveness-of-evidence (curvature weight of aligned points relative to
+total), with a penalty for contradictory evidence. Output a rich explanation
+struct with per-segment spatial breakdown, derived masks (occlusion, excess),
+and a scalar confidence score suitable for hypothesis ranking.

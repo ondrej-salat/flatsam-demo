@@ -1,0 +1,1 @@
+"""FlatSAM2 package"""

@@ -1,0 +1,41 @@
+[project]
+name = "flatsam2"
+version = "0.0.0"
+description = "FlatSAM: a planar object tracker using SAM and ptlflow"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [ { name = "Jonas Serych" } ]
+dependencies = [
+  # from modules
+  "torch==2.7.1",
+  "torchvision==0.22.1",
+  # "Triton==3.5.0",
+  "ptlflow @ git+https://github.com/serycjon/ptlflow@844b51e2a75e876823deeda53be7abf90e413178",
+  "sam3 @ git+https://github.com/serycjon/sam3@0febedec6efe4cc622b0908b3788add56219b79c",
+  "lomatch @ git+https://github.com/davnords/LoMa@8fb59c458f2a2ef44314f462467b229c27786bf0",
+  # additional dependencies
+  "numpy",
+  "opencv-python-headless<4.11",
+  "tqdm",
+  "pydantic>=2.0",
+  "xformers",
+  "scipy",
+  "scikit-image",
+  "einops",
+  "fastapi",
+  "uvicorn",
+]
+
+# Explicitly package only the source in `flatsam2/`
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flatsam2*"]
+
+[build-system]
+requires = ["setuptools>=61.0,<81", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv.extra-build-dependencies]
+iopath = ["setuptools<81"]
+antlr4-python3-runtime = ["setuptools<81"]

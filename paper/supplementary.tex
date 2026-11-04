@@ -1,0 +1,116 @@
+\appendix
+
+\section{Additional Method Details}
+\label{sec:supp-method}
+
+\noindent\textbf{Mask-derived pose.}
+The mask branch reproduces \samh~\cite{serych2026woftsam}; we restate it here so the branch our contribution names corners for is self-contained.
+Contours of the binary mask $S_t$ are extracted and fragments shorter than 20 points are discarded.
+Contour points adjacent to the image border are marked, because a silhouette edge that coincides with the frame boundary is an artefact of the field of view rather than an object edge.
+Tangents are estimated by finite differences with a four-point step and vote into a $(\text{distance},\text{angle})$ accumulator; the four strongest peaks give the dominant boundary lines.
+Each line is refit by least squares to the contour points that voted for it, and lines with no support or a supported segment shorter than five pixels are dropped.
+Intersections of the remaining line pairs are corner candidates, kept only within 80 pixels of a contour point.
+
+\noindent\textbf{Correspondence and partial visibility.}
+Candidate corners carry no identity, so all injective assignments between the four template corners and the surviving intersections are enumerated.
+Two-corner assignments are required to be consistent: a pair of adjacent template corners must map to intersections that share a line, and a pair of opposite corners must not.
+Only the surviving assignments of maximal size are scored.
+Every assignment yields a transformation whose form depends on how many corners it uses: four or more give a full homography by DLT, two or three give a similarity composed onto the branch's previous homography, one gives a translation, and none leaves the previous homography unchanged.
+The scored quantity is displacement from the branch's own previous prediction, so the accepted candidate is the one closest to the incumbent pose --- a zero-motion prior, not a fit quality.
+Because two and three corner cases are resolved against the previous pose, the branch is a frame-to-frame composition exactly while the target is partly visible, and returns to an initial-to-current estimate as soon as four corners are recovered.
+
+This is also where the cyclic ambiguity enters.
+Selecting the candidate nearest the incumbent propagates the incumbent's labelling instead of testing it: when the incumbent is mis-named, the assignment closest to it is the equally mis-named one, and a similarity or translation update inherits that labelling unchanged.
+A mis-naming therefore persists until evidence from outside the mask breaks the tie.
+\Cref{sec:match-naming} is that tie-breaker.
+
+\section{Naming Sensitivity}
+\label{sec:supp-naming}
+
+We sweep naming parameters on 50 PlanarTrack training sequences rather than selecting them on the reported test split.
+The sweep scores whether each parameter setting selects the cyclic naming that ground truth prefers for the mask-branch pose; it is a decision-level analysis, not an end-to-end p@15 re-run.
+
+\begin{table*}[t]
+    \centering
+    \setlength{\tabcolsep}{4pt}
+    \begin{tabular}{lrrrrrrrrr}
+        \toprule
+        $\tau$ (px) & 3 & 5 & 7 & 10 & 15 & 20 & \textbf{30} & 50 & 100\\
+        \midrule
+        naming accuracy & 99.35 & 99.37 & 99.36 & 99.38 & 99.38 & 99.37 & 99.37 & 99.37 & 99.34\\
+        \bottomrule
+    \end{tabular}
+    \caption{Train-split naming-decision accuracy (\%), holding the raw-match minimum at eight.
+    Bold marks the deployed value.}
+    \label{tab:supp-tau}
+\end{table*}
+
+\begin{table}[t]
+    \centering
+    \setlength{\tabcolsep}{4pt}
+    \begin{tabular}{lrrrrrr}
+        \toprule
+        minimum matches & 0 & 4 & \textbf{8} & 12 & 16 & 32\\
+        \midrule
+        naming accuracy & 99.28 & 99.36 & 99.37 & 99.38 & 99.38 & 99.37\\
+        \bottomrule
+    \end{tabular}
+    \caption{Train-split naming-decision accuracy (\%), holding $\tau=30$ pixels.
+    Bold marks the deployed value.}
+    \label{tab:supp-min-matches}
+\end{table}
+
+Accuracy in \cref{tab:supp-tau,tab:supp-min-matches} varies by only 0.04\,pp over the full $\tau\in[3,100]$ range and by 0.10\,pp for raw-match minima from zero to 32.
+The claim is the flatness, not the maximum: accuracy peaks at $\tau=10$--$15$ and the deployed $\tau=30$ is 0.01\,pp below it, so adopting the argmax would be tuning on the sweep rather than choosing inside a plateau.
+One coverage caveat applies to \cref{tab:supp-min-matches}: every localized frame of this train sample carries at least eight raw matches, against 87.2\% of frames on \pttst, where the remaining 12.8\% abstain and keep the incumbent naming.
+The minimum-match plateau therefore describes the rule's accuracy where it fires, not the cost of the abstentions it causes in deployment.
+
+\section{Additional Results}
+\label{sec:supp-results}
+
+\Cref{tab:supp-cross-full} gives the cross-dataset comparison of \cref{tab:cross-dataset} at both precision thresholds and with the corner-naming gap, on all six benchmarks.
+Three things are visible that the main table cannot show.
+First, the margins over \woftsam are robustness margins rather than precision ones: the lead grows from 8.2\,pp at p@5 to 10.4\,pp at p@15 on \pttst and from 4.4 to 5.6\,pp on TMT, while the saturated POT column narrows from 1.5 to 1.0\,pp.
+UCSB is the exception in both directions: the two trackers are within 1.2\,pp at p@5 there, and the deficit opens to 4.4\,pp at p@15, which is the signature of lost frames rather than imprecise ones.
+Second, the deployed naming gap is at most 0.03\,pp outside \pttst and exactly zero on two benchmarks, which is what a naming mechanism should look like once it works.
+Third, \samh --- the mask branch run alone --- is 29 to 66\,pp behind \woftsam at p@5 on the classical datasets while losing far less at p@15, so its errors are dominated by imprecise poses rather than lost targets; \cref{sec:failure-analysis} shows what one looks like.
+
+\begin{table*}[t]
+    \centering
+    \setlength{\tabcolsep}{4pt}
+    \begin{tabular}{llrrrrrr|r}
+        \toprule
+        % woftsam_samfallback_nl, sam_H, loma_samh_decoupled_rerun,
+        % loma_samh_matchnaming; experiments/results_tables.py.
+        method & metric & \pttst & POT-210 & POIC & TMT & UCSB & MPOT-3K & worst\\
+        \midrule
+        \multirow{3}{*}{\woftsam~\cite{serych2026woftsam}}
+        & p@5 & 57.4 & 91.9 & 97.6 & 79.9 & \frst{56.5} & 67.4 & \frst{56.5}\\
+        & p@15 & 77.6 & 97.5 & 99.2 & 89.1 & \frst{96.6} & 90.8 & 77.6\\
+        & \brgap & 1.55 & \frst{0.00} & \frst{0.00} & 0.63 & \frst{0.03} & 0.30 & 1.55\\
+        \midrule
+        \multirow{3}{*}{\samh~\cite{serych2026woftsam}}
+        & p@5 & 62.4 & 68.6 & 68.4 & 14.3 & 20.9 & 54.7 & 14.3\\
+        & p@15 & 80.5 & 89.4 & 80.8 & 54.3 & 54.3 & 82.0 & 54.3\\
+        & \brgap & 2.56 & 1.10 & \frst{0.00} & 2.74 & 0.38 & 1.44 & 2.74\\
+        \midrule
+        \multirow{3}{*}{\flatsam, DINOv2 naming}
+        & p@5 & \frst{65.6} & \frst{93.6} & \frst{97.7} & \frst{84.3} & 55.2 & \frst{69.1} & 55.2\\
+        & p@15 & 87.7 & \frst{98.5} & \frst{99.3} & 94.5 & 92.2 & \frst{92.6} & 87.7\\
+        & \brgap & 1.57 & \frst{0.00} & \frst{0.00} & 0.36 & \frst{0.03} & 0.03 & 1.57\\
+        \midrule
+        \multirow{3}{*}{\textbf{\flatsam, match naming}}
+        & p@5 & \frst{65.6} & 93.4 & \frst{97.7} & \frst{84.3} & 55.3 & 69.0 & 55.3\\
+        & p@15 & \frst{88.0} & \frst{98.5} & \frst{99.3} & \frst{94.7} & 92.2 & \frst{92.6} & \frst{88.0}\\
+        & \brgap & \frst{1.36} & \frst{0.00} & 0.02 & \frst{0.03} & \frst{0.03} & \frst{0.00} & \frst{1.36}\\
+        \bottomrule
+    \end{tabular}
+    \caption{Complete cross-dataset results: p@5, p@15 and the corner-naming gap $\brgap$ on all six benchmarks.
+    Best value per row group in bold; lower is better for $\brgap$.
+    The worst column is each method's weakest benchmark for that metric.}
+    \label{tab:supp-cross-full}
+\end{table*}
+
+\noindent\textbf{MPOT-3K protocol.}
+Each annotated planar instance is initialized and tracked as an independent single-target task, giving 573 tasks scored with the same alignment-error precision as every other dataset here.
+That isolates per-plane pose accuracy, which is what this paper changes, but it neither detects instances nor maintains identities across them, so it is not comparable to the benchmark's MOTA, IDF1, and success-rate protocol.

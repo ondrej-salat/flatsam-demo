@@ -1,0 +1,878 @@
+NN HOMOGRAPHY QUALITY ESTIMATION — IMPLEMENTATION PLAN
+=======================================================
+
+HIGH-LEVEL TODO
+===============
+
+  [ ] 1. Extend ReferenceContour to store mask_A and tangent directions
+  [ ] 2. Implement shared preprocessing pipeline (Steps 1–6)
+  [ ] 3. Implement Option E model (boundary transformer)
+  [ ] 4. Implement Option C model (SDF-crop CNN)
+  [ ] 5. Implement censored heteroscedastic loss
+  [ ] 6. Implement synthetic data generation
+  [ ] 7. Implement training script with evaluation
+  [ ] 8. Implement inference module for tracker integration
+  [ ] 9. Train, evaluate, select best model
+  [ ] 10. Integrate into FlatSAMTracker
+
+
+======================================================================
+FILE LAYOUT
+======================================================================
+
+flatsam2/
+  nn/
+    __init__.py
+    preprocess.py        # Shared preprocessing (Steps 1–6)
+    models.py            # Both architectures (Option E + Option C)
+    loss.py              # Censored heteroscedastic loss
+    data_gen.py          # Synthetic shape + scene + error generation
+    train.py             # Training loop + validation + checkpointing
+    inference.py         # Inference wrapper for tracker integration
+
+  homography_quality.py  # MODIFY: extend ReferenceContour
+
+
+======================================================================
+TASK 1 — EXTEND ReferenceContour
+======================================================================
+
+File: flatsam2/homography_quality.py
+
+Add to ReferenceContour dataclass:
+  mask: np.ndarray            # (H, W) uint8, original binary mask
+  tangent_sin: np.ndarray     # (N,) float32, sin(θ_i) at each contour point
+  tangent_cos: np.ndarray     # (N,) float32, cos(θ_i) at each contour point
+
+In ReferenceContour.build():
+  - Accept and store mask (already passed as input, just store it).
+  - Compute tangent directions from ordered contour points:
+      dx = points[(i+1) % N] - points[(i-1) % N]   (central difference)
+      norm = sqrt(dx² + dy²) + eps
+      tangent_sin[i] = dy / norm
+      tangent_cos[i] = dx / norm
+
+Add a method to get N=128 resampled points + tangents for NN input:
+  ReferenceContour.get_nn_points(n_points=128)
+    → (points_128, tangent_sin_128, tangent_cos_128)
+  Uses _resample_at_spacing() with spacing = perimeter / n_points.
+  Recomputes tangent directions on the resampled points.
+
+
+======================================================================
+TASK 2 — SHARED PREPROCESSING (preprocess.py)
+======================================================================
+
+File: flatsam2/nn/preprocess.py
+
+Main function:
+  preprocess(
+      ref: ReferenceContour,
+      mask_B: np.ndarray,         # (H, W) uint8
+      H: np.ndarray,              # (3, 3) float64
+      image_shape: (int, int),    # (H, W)
+      n_points: int = 128,
+  ) → dict
+
+Returns dict with all tensors needed by both architectures.
+
+Implementation follows Steps 1–6 from the design plan:
+
+Step 1 — Warp reference contour points:
+  pts_A_128, tan_sin_A, tan_cos_A = ref.get_nn_points(128)
+  pts_Ap = _warp_points(pts_A_128, H)                    # (128, 2)
+  is_in_view = ((pts_Ap[:, 0] >= 0) & (pts_Ap[:, 0] < W) &
+                (pts_Ap[:, 1] >= 0) & (pts_Ap[:, 1] < H)).astype(np.float32)
+
+Step 2 — SDF_B:
+  sdf_B = _compute_sdf(mask_B)                            # (H, W) float32
+
+Step 3 — Warp mask_A, compute SDF_A':
+  mask_Ap = cv2.warpPerspective(ref.mask, H, (W, H_img),
+                                flags=cv2.INTER_NEAREST,
+                                borderValue=0)
+  sdf_Ap = _compute_sdf(mask_Ap)                          # (H, W) float32
+
+Step 4 — Extract ∂B:
+  pts_B = _extract_and_sample_contour_fixed_n(mask_B, n_points=128)
+  If mask_B has no contour (empty mask): return None / skip sample.
+  Compute tangent directions for ∂B (same central-difference method).
+
+Step 5 — Bounding box for position encoding:
+  in_view_pts = pts_Ap[is_in_view > 0.5]
+  all_pts = np.concatenate([in_view_pts, pts_B]) if len(in_view_pts) > 0
+            else pts_B
+  x_min, y_min = all_pts.min(axis=0)
+  x_max, y_max = all_pts.max(axis=0)
+  Expand 10% each side, clip to [0, W) × [0, H).
+  Handle degenerate bbox (width or height < 1px): expand to at least 1px.
+
+  Normalised coordinates for all points:
+    x_hat = (x - x_min) / (x_max - x_min + eps)
+    y_hat = (y - y_min) / (y_max - y_min + eps)
+
+Step 6 — Sample SDFs at boundary points:
+  D_large = sqrt(H² + W²)   (image diagonal)
+  sdf_B_at_Ap = np.where(is_in_view,
+                          _bilinear_sample(sdf_B, pts_Ap),
+                          D_large)                         # (128,)
+  sdf_Ap_at_B = _bilinear_sample(sdf_Ap, pts_B)           # (128,)
+
+Return dict:
+  {
+    # For Option E
+    "pts_Ap":          pts_Ap,           # (128, 2) float32
+    "pts_B":           pts_B,            # (128, 2) float32
+    "sdf_B_at_Ap":     sdf_B_at_Ap,      # (128,) float32
+    "sdf_Ap_at_B":     sdf_Ap_at_B,      # (128,) float32
+    "tan_sin_A":       tan_sin_A,        # (128,) float32
+    "tan_cos_A":       tan_cos_A,        # (128,) float32
+    "tan_sin_B":       tan_sin_B,        # (128,) float32
+    "tan_cos_B":       tan_cos_B,        # (128,) float32
+    "is_in_view":      is_in_view,       # (128,) float32
+    "norm_xy_A":       norm_xy_A,        # (128, 2) float32
+    "norm_xy_B":       norm_xy_B,        # (128, 2) float32
+    "bbox":            (x_min, y_min, x_max, y_max),
+
+    # For Option C
+    "mask_Ap":         mask_Ap,          # (H, W) uint8
+    "sdf_Ap":          sdf_Ap,           # (H, W) float32
+    "mask_B":          mask_B,           # (H, W) uint8
+    "sdf_B":           sdf_B,            # (H, W) float32
+  }
+
+Helper — _extract_and_sample_contour_fixed_n(mask, n_points):
+  Extract contour via cv2.findContours.
+  If multiple contours, use the longest.
+  Resample to exactly n_points using np.interp on cumulative arc length.
+  Return (n_points, 2) float32.
+
+Helper — _compute_tangent_directions(pts):
+  Central difference on ordered (N, 2) array (wrapped).
+  Returns (sin_arr, cos_arr) each (N,) float32.
+
+
+======================================================================
+TASK 3 — OPTION E MODEL: BOUNDARY TRANSFORMER (models.py)
+======================================================================
+
+File: flatsam2/nn/models.py
+
+class BoundaryTransformer(nn.Module):
+  """Primary architecture. ~115K parameters."""
+
+  __init__(self, d_model=64, n_heads=4, n_layers=2, n_points=128,
+           n_fourier_bands=4, n_raw_features=4):
+
+    self.input_dim = n_raw_features + 4 * n_fourier_bands  # 4 + 16 = 20
+    self.input_proj = nn.Sequential(
+        nn.Linear(self.input_dim, d_model),
+        nn.LayerNorm(d_model),
+    )
+    self.type_embed = nn.Embedding(2, d_model)    # 0 = ∂A', 1 = ∂B
+
+    self.layers = nn.ModuleList([
+        TransformerBlock(d_model, n_heads) for _ in range(n_layers)
+    ])
+
+    self.rmse_head = nn.Sequential(
+        nn.Linear(2 * d_model, 64),
+        nn.ReLU(),
+        nn.Linear(64, 1),
+    )
+    self.sigma_head = nn.Sequential(
+        nn.Linear(2 * d_model, 64),
+        nn.ReLU(),
+        nn.Linear(64, 1),
+    )
+    # Initialise sigma head bias to 0 (sigma_init = 1px = exp(0))
+
+  forward(self, features_A, features_B):
+    """
+    features_A: (B, N, 20) — raw + Fourier PE for ∂A' points
+    features_B: (B, N, 20) — raw + Fourier PE for ∂B points
+    Returns: (predicted_rmse, log_sigma)  each (B, 1)
+    """
+    tok_A = self.input_proj(features_A) + self.type_embed(0)  # (B, N, d)
+    tok_B = self.input_proj(features_B) + self.type_embed(1)  # (B, N, d)
+
+    for layer in self.layers:
+        tok_A, tok_B = layer(tok_A, tok_B)
+
+    v_A = tok_A.mean(dim=1)                     # (B, d)
+    v_B = tok_B.mean(dim=1)                     # (B, d)
+    v = torch.cat([v_A, v_B], dim=-1)           # (B, 2d)
+
+    raw_rmse = self.rmse_head(v)                # (B, 1)
+    predicted_rmse = F.softplus(raw_rmse)       # non-negative
+    log_sigma = self.sigma_head(v).clamp(-5, 5) # (B, 1)
+
+    return predicted_rmse.squeeze(-1), log_sigma.squeeze(-1)
+
+
+class TransformerBlock(nn.Module):
+  """One block: self-attn A, self-attn B, cross A→B, cross B→A."""
+
+  __init__(self, d_model, n_heads):
+    self.self_attn_A  = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+    self.self_attn_B  = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+    self.cross_attn_AB = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+    self.cross_attn_BA = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+    self.norm_sa_A = nn.LayerNorm(d_model)
+    self.norm_sa_B = nn.LayerNorm(d_model)
+    self.norm_ca_A = nn.LayerNorm(d_model)
+    self.norm_ca_B = nn.LayerNorm(d_model)
+
+  forward(self, tok_A, tok_B):
+    # Self-attention A
+    tok_A = self.norm_sa_A(tok_A + self.self_attn_A(tok_A, tok_A, tok_A)[0])
+    # Self-attention B
+    tok_B = self.norm_sa_B(tok_B + self.self_attn_B(tok_B, tok_B, tok_B)[0])
+    # Cross-attention A→B (A queries B)
+    tok_A = self.norm_ca_A(tok_A + self.cross_attn_AB(tok_A, tok_B, tok_B)[0])
+    # Cross-attention B→A (B queries A)
+    tok_B = self.norm_ca_B(tok_B + self.cross_attn_BA(tok_B, tok_A, tok_A)[0])
+    return tok_A, tok_B
+
+
+Feature construction (static method or standalone function):
+
+  build_option_e_features(preprocess_dict, n_fourier_bands=4) → (feat_A, feat_B)
+    """Convert preprocess output to (N, 20) feature tensors."""
+
+    For ∂A' (N points):
+      raw = stack([sdf_B_at_Ap, tan_sin_A, tan_cos_A, is_in_view])  # (N, 4)
+      pe  = fourier_pe(norm_xy_A, K=4)                               # (N, 16)
+      feat_A = cat([raw, pe], dim=-1)                                 # (N, 20)
+
+    For ∂B (N points):
+      raw = stack([sdf_Ap_at_B, tan_sin_B, tan_cos_B, ones])         # (N, 4)
+      pe  = fourier_pe(norm_xy_B, K=4)                               # (N, 16)
+      feat_B = cat([raw, pe], dim=-1)                                 # (N, 20)
+
+    return feat_A, feat_B
+
+  fourier_pe(xy, K=4) → (N, 4K):
+    """Fourier positional encoding."""
+    result = []
+    for k in range(K):
+      freq = 2**k * pi
+      result.extend([sin(freq * xy[:, 0]), cos(freq * xy[:, 0]),
+                      sin(freq * xy[:, 1]), cos(freq * xy[:, 1])])
+    return stack(result, dim=-1)
+
+
+======================================================================
+TASK 4 — OPTION C MODEL: SDF-CROP CNN (models.py)
+======================================================================
+
+File: flatsam2/nn/models.py (same file)
+
+class SDFCropCNN(nn.Module):
+  """Backup architecture. ~150K parameters."""
+
+  __init__(self, crop_size=128):
+    self.backbone = nn.Sequential(
+        DWSBlock(4, 32, stride=2),      # → 32 × 64 × 64
+        DWSBlock(32, 64, stride=2),     # → 64 × 32 × 32
+        DWSBlock(64, 128, stride=2),    # → 128 × 16 × 16
+        DWSBlock(128, 128, stride=2),   # → 128 × 8 × 8
+    )
+    self.pool = nn.AdaptiveAvgPool2d(1)
+    self.rmse_head = nn.Sequential(
+        nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1))
+    self.sigma_head = nn.Sequential(
+        nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1))
+
+  forward(self, x):
+    """
+    x: (B, 4, 128, 128)  — [binary_A', SDF_A', binary_B, SDF_B]
+    Returns: (predicted_rmse, log_sigma)  each (B,)
+    Note: predicted_rmse is in crop-pixel units; caller must divide by s.
+    """
+    feat = self.pool(self.backbone(x)).flatten(1)   # (B, 128)
+    raw_rmse = self.rmse_head(feat)
+    predicted_rmse = F.softplus(raw_rmse)
+    log_sigma = self.sigma_head(feat).clamp(-5, 5)
+    return predicted_rmse.squeeze(-1), log_sigma.squeeze(-1)
+
+
+class DWSBlock(nn.Module):
+  """Depthwise-separable conv block: DWConv + PWConv + BN + ReLU."""
+
+  __init__(self, in_ch, out_ch, stride=2):
+    self.dw = nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1,
+                        groups=in_ch, bias=False)
+    self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+    self.bn = nn.BatchNorm2d(out_ch)
+    self.relu = nn.ReLU(inplace=True)
+
+  forward(self, x):
+    return self.relu(self.bn(self.pw(self.dw(x))))
+
+
+Crop construction (standalone function):
+
+  build_option_c_input(preprocess_dict, crop_size=128) → (tensor_4ch, scale_factor)
+    """Build 4-channel 128×128 crop from preprocess output."""
+
+    mask_Ap = preprocess_dict["mask_Ap"]
+    sdf_Ap  = preprocess_dict["sdf_Ap"]
+    mask_B  = preprocess_dict["mask_B"]
+    sdf_B   = preprocess_dict["sdf_B"]
+
+    # 1. Bounding box of union(A', B), expand 20%, clip to image
+    bbox = union_bbox(mask_Ap, mask_B)
+    bbox = expand_bbox(bbox, factor=0.2, clip_to=image_shape)
+
+    # 2. Crop all four channels
+    crop_Ap = mask_Ap[y0:y1, x0:x1]
+    crop_sdf_Ap = sdf_Ap[y0:y1, x0:x1]
+    crop_B  = mask_B[y0:y1, x0:x1]
+    crop_sdf_B = sdf_B[y0:y1, x0:x1]
+
+    # 3. Isotropic resize to crop_size × crop_size
+    h, w = crop_Ap.shape
+    s = crop_size / max(h, w)
+    new_h, new_w = round(h * s), round(w * s)
+
+    # Resize: nearest for binary, bilinear for SDF
+    # Pad shorter dimension to crop_size with zeros
+    # Rescale SDF values by s
+
+    # 4. Stack into (4, crop_size, crop_size) tensor
+    tensor = np.stack([binary_Ap_resized.astype(np.float32),
+                       sdf_Ap_resized * s,
+                       binary_B_resized.astype(np.float32),
+                       sdf_B_resized * s], axis=0)
+
+    return torch.from_numpy(tensor), s
+
+
+======================================================================
+TASK 5 — LOSS FUNCTION (loss.py)
+======================================================================
+
+File: flatsam2/nn/loss.py
+
+def censored_heteroscedastic_loss(
+    pred_rmse: Tensor,      # (B,)
+    log_sigma: Tensor,      # (B,)
+    gt_rmse: Tensor,        # (B,)
+    censored: Tensor,       # (B,) bool
+    n_clip: float = 30.0,
+) → Tensor:
+    """
+    Censored heteroscedastic regression loss.
+
+    Uncensored (gt_rmse ≤ n_clip):
+      L = (pred - gt)² · exp(-2·log_sigma) + 2·log_sigma
+
+    Censored (gt_rmse > n_clip):
+      L = relu(n_clip - pred)²
+    """
+    uncensored = ~censored
+
+    # Uncensored loss
+    residual = pred_rmse[uncensored] - gt_rmse[uncensored]
+    ls = log_sigma[uncensored]
+    loss_unc = residual**2 * torch.exp(-2 * ls) + 2 * ls
+
+    # Censored loss
+    shortfall = F.relu(n_clip - pred_rmse[censored])
+    loss_cen = shortfall**2
+
+    # Combine
+    total = torch.zeros_like(pred_rmse)
+    total[uncensored] = loss_unc
+    total[censored] = loss_cen
+
+    return total.mean()
+
+
+======================================================================
+TASK 6 — SYNTHETIC DATA GENERATION (data_gen.py)
+======================================================================
+
+File: flatsam2/nn/data_gen.py
+
+----------------------------------------------------------------------
+6.1 Shape generators
+----------------------------------------------------------------------
+
+CANVAS_H, CANVAS_W = 720, 1280
+
+def generate_convex_polygon(rng) → np.ndarray:
+    """Random convex polygon mask. (H, W) uint8.
+    N=5..20 vertices, aspect ratio 0.3..3.0, area 10%..60% of canvas."""
+    1. Sample N vertices on unit circle at random angles, sorted.
+    2. Scale by random (rx, ry) for aspect ratio.
+    3. Scale to target area (sample area fraction, compute radius).
+    4. Place at random position ensuring mask fits in canvas.
+    5. Rasterize via cv2.fillPoly.
+    Return mask, corners (bounding box corners (2, 4) for GT).
+
+def generate_nonconvex_shape(rng) → np.ndarray:
+    """Star, L/T/C shape, or concave polygon. Same output format."""
+    Subtypes (equal probability):
+      - Star: inner/outer radius ratio 0.3..0.7, 4..8 points
+      - L/T/C shape: composed of 2–3 rectangles
+      - Concave polygon: convex polygon with 1–3 vertices pushed inward
+    Same scaling/placement logic as convex.
+
+def generate_smooth_shape(rng) → np.ndarray:
+    """Ellipse, rounded rectangle, or Bezier blob. Same output format."""
+    Subtypes:
+      - Ellipse: random axes, cv2.ellipse
+      - Rounded rect: random corner radius
+      - Bezier blob: 4–6 control points, evaluate dense curve, fillPoly
+
+def generate_shape(rng) → (mask, corners):
+    """Sample one shape. Returns (H, W) uint8 mask and (2, 4) corners."""
+    p = rng.random()
+    if   p < 0.4:  return generate_convex_polygon(rng)
+    elif p < 0.8:  return generate_nonconvex_shape(rng)
+    else:          return generate_smooth_shape(rng)
+
+corners = bounding box of mask: [[x_min, x_max, x_max, x_min],
+                                  [y_min, y_min, y_max, y_max]]
+
+----------------------------------------------------------------------
+6.2 Scene transform sampling
+----------------------------------------------------------------------
+
+def sample_scene_transform(rng, image_shape) → np.ndarray:
+    """Sample a realistic homography T.
+    Returns (3, 3) float64."""
+    rotation: uniform(-30°, +30°)
+    scale: log-uniform(0.6, 1.6)
+    translation: uniform(-0.15, +0.15) × (W, H)
+    projective: small random perturbation to H[2, 0:2]
+      (magnitude ~ uniform(0, 5e-5))
+
+    Compose as:
+      center = (W/2, H/2)
+      T = translate(center) @ scale @ rotate @ translate(-center) @ translate(tx, ty)
+      T[2, 0:2] += projective perturbation
+      T /= T[2, 2]
+
+----------------------------------------------------------------------
+6.3 Mask_B augmentation
+----------------------------------------------------------------------
+
+def augment_mask_B(mask_B_clean, rng) → np.ndarray:
+    """Apply one augmentation mode to mask_B_clean.
+    Returns (H, W) uint8."""
+    mode = rng.choice(["clean", "occlude", "spill", "noisy", "combo"],
+                      p=[0.15, 0.35, 0.20, 0.15, 0.15])
+
+    clean:   return mask_B_clean
+    occlude: remove random rectangular/elliptical occluder
+             area = uniform(0.05, 0.90) × mask_area
+             Place occluder overlapping the mask.
+             mask_B = mask_B_clean & ~occluder
+    spill:   add random blob tangent to mask boundary
+             area = uniform(0.05, 0.40) × mask_area
+             mask_B = mask_B_clean | spill_blob
+    noisy:   morphological noise
+             kernel = rng.integers(1, 8)
+             ops = rng.choice(["dilate", "erode", "open", "close"])
+             apply 1–2 morphological ops
+    combo:   apply two of the above (excluding clean)
+
+----------------------------------------------------------------------
+6.4 Error regime and H_candidate construction
+----------------------------------------------------------------------
+
+def sample_h_candidate(T, corners_A, rng, n_clip=30.0)
+    → (H_candidate, rmse_actual, censored):
+    """Sample H_candidate in one of four error regimes."""
+
+    regime = rng.choice(["perfect", "good", "borderline", "bad"],
+                        p=[0.10, 0.35, 0.20, 0.35])
+
+    perfect:
+      H_candidate = T.copy()
+      rmse = 0.0, censored = False
+
+    good (target RMSE ~ LogUniform(0.5, 15)):
+      target = exp(rng.uniform(log(0.5), log(15)))
+      H_candidate = perturb_homography_to_target_rmse(T, corners_A, target, rng)
+      rmse = corner_rmse(T, H_candidate, corners_A)
+      censored = (rmse > n_clip)  # shouldn't happen but guard
+
+    borderline (target RMSE ~ Uniform(15, 30)):
+      target = rng.uniform(15, 30)
+      H_candidate = perturb_homography_to_target_rmse(T, corners_A, target, rng)
+      rmse = corner_rmse(T, H_candidate, corners_A)
+      censored = (rmse > n_clip)
+
+    bad (large perturbation):
+      H_candidate = random large perturbation of T
+      rmse = corner_rmse(T, H_candidate, corners_A)
+      censored = True   # always censored
+
+    return H_candidate, rmse, censored
+
+
+def perturb_homography_to_target_rmse(T, corners_A, target_rmse, rng)
+    → np.ndarray:
+    """Binary-search perturbation magnitude to hit target corner RMSE.
+
+    1. Sample random perturbation direction:
+       - Small rotation + scale + translation perturbation
+       - Parameterise as a 1D magnitude α
+    2. Binary search on α ∈ [0, α_max] so that
+       corner_rmse(T, T @ perturb(α), corners_A) ≈ target_rmse
+       Tolerance: ±10% or ±0.5px, whichever is larger.
+    3. Max 20 iterations.
+    """
+
+def corner_rmse(H_true, H_candidate, corners_A) → float:
+    """RMSE of 4 warped corners (same as alignment_error in metrics.py).
+    corners_A: (2, 4) — [[x1..x4], [y1..y4]]
+    """
+    pts_true = warp_corners(corners_A, H_true)      # (2, 4)
+    pts_cand = warp_corners(corners_A, H_candidate)  # (2, 4)
+    diff = pts_true - pts_cand
+    return float(np.sqrt((diff**2).sum(axis=0).mean()))
+
+----------------------------------------------------------------------
+6.5 Full sample generation
+----------------------------------------------------------------------
+
+def generate_sample(rng, n_points=128, canvas_shape=(720, 1280))
+    → dict | None:
+    """Generate one complete training sample.
+
+    Returns dict with keys:
+      "features_A":  (128, 20) float32  — Option E input for ∂A'
+      "features_B":  (128, 20) float32  — Option E input for ∂B
+      "crop_4ch":    (4, 128, 128) float32 — Option C input
+      "scale_factor": float             — s for Option C rescaling
+      "gt_rmse":     float              — ground truth corner RMSE (px)
+      "censored":    bool               — whether RMSE > n_clip
+    Returns None if sample is degenerate (empty mask after augmentation).
+    """
+    1. mask_A, corners_A = generate_shape(rng)
+    2. T = sample_scene_transform(rng, canvas_shape)
+    3. mask_B_clean = cv2.warpPerspective(mask_A, T, (W, H),
+                                          flags=cv2.INTER_NEAREST)
+       Skip if mask_B_clean has < 100 nonzero pixels.
+    4. mask_B = augment_mask_B(mask_B_clean, rng)
+       Skip if mask_B has < 100 nonzero pixels.
+    5. H_candidate, gt_rmse, censored = sample_h_candidate(
+           T, corners_A, rng)
+    6. Build ReferenceContour from mask_A (lightweight — just need
+       points, tangents, and stored mask for preprocessing).
+    7. prep = preprocess(ref, mask_B, H_candidate, canvas_shape, n_points)
+       If prep is None (no contour found): return None.
+    8. feat_A, feat_B = build_option_e_features(prep)
+    9. crop_4ch, s = build_option_c_input(prep)
+    10. Apply random flips (p=0.5 each axis):
+        - Horizontal: negate x-coordinates, flip crop horizontally
+        - Vertical: negate y-coordinates, flip crop vertically
+        (Flips don't change RMSE — it's symmetric.)
+    11. Return dict.
+
+----------------------------------------------------------------------
+6.6 Dataset class
+----------------------------------------------------------------------
+
+class SyntheticHomographyDataset(torch.utils.data.IterableDataset):
+    """On-the-fly synthetic data generation.
+    Each worker gets its own RNG seeded by (base_seed + worker_id).
+    """
+
+    __init__(self, architecture="option_e", seed=0, n_points=128):
+        self.architecture = architecture
+        self.seed = seed
+        self.n_points = n_points
+
+    __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_seed = self.seed + (worker_info.id if worker_info else 0)
+        rng = np.random.default_rng(worker_seed)
+        while True:
+            sample = generate_sample(rng, self.n_points)
+            if sample is None:
+                continue
+            if self.architecture == "option_e":
+                yield (torch.from_numpy(sample["features_A"]),
+                       torch.from_numpy(sample["features_B"]),
+                       torch.tensor(sample["gt_rmse"], dtype=torch.float32),
+                       torch.tensor(sample["censored"], dtype=torch.bool))
+            else:  # option_c
+                yield (torch.from_numpy(sample["crop_4ch"]),
+                       torch.tensor(sample["scale_factor"], dtype=torch.float32),
+                       torch.tensor(sample["gt_rmse"], dtype=torch.float32),
+                       torch.tensor(sample["censored"], dtype=torch.bool))
+
+
+Validation set: same class but with a fixed seed (e.g., seed=999999)
+and limited to 50K samples (use islice or a counter).
+
+
+======================================================================
+TASK 7 — TRAINING SCRIPT (train.py)
+======================================================================
+
+File: flatsam2/nn/train.py
+
+Entry point: python -m flatsam2.nn.train [--arch option_e|option_c] [--opts...]
+
+----------------------------------------------------------------------
+7.1 Configuration
+----------------------------------------------------------------------
+
+@dataclass
+class TrainConfig:
+    arch: str = "option_e"         # "option_e" or "option_c"
+    d_model: int = 64
+    n_heads: int = 4
+    n_layers: int = 2
+    n_points: int = 128
+    crop_size: int = 128           # Option C only
+
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    batch_size: int = 128
+    grad_clip: float = 1.0
+    n_clip: float = 30.0
+
+    epochs: int = 50
+    steps_per_epoch: int = 10_000
+    val_steps: int = 5_000         # validation samples per epoch
+    patience: int = 5
+
+    num_workers: int = 4
+    seed: int = 42
+    output_dir: str = "checkpoints/nn_quality"
+
+----------------------------------------------------------------------
+7.2 Training loop
+----------------------------------------------------------------------
+
+def train(config: TrainConfig):
+    1. Set seeds (torch, numpy, random).
+    2. Create model (BoundaryTransformer or SDFCropCNN).
+    3. Create optimizer: AdamW(model.parameters(), lr, weight_decay).
+    4. Create scheduler: CosineAnnealingLR(optimizer, T_max=epochs).
+    5. Create train dataset + dataloader (num_workers workers, pin_memory).
+    6. Create val dataset + dataloader (fixed seed).
+    7. For each epoch:
+       a. Train for steps_per_epoch steps:
+          - Forward pass → pred_rmse, log_sigma
+          - For Option C: pred_rmse = pred_rmse / s, similarly log_sigma
+          - Compute censored_heteroscedastic_loss
+          - Backward, clip gradients (max_norm=1.0), optimizer step
+          - Log running loss every 100 steps
+       b. Validate on val_steps samples:
+          - Compute val loss (same loss function)
+          - Compute Tier 1 metrics (TPR, TNR, balanced accuracy at 15px)
+          - Compute Tier 2 metrics (Spearman r on uncensored samples)
+       c. Log epoch metrics.
+       d. Save checkpoint if val loss improved.
+       e. Early stopping: if val loss hasn't improved for patience epochs, stop.
+       f. Step scheduler.
+    8. Save final model + training log.
+
+----------------------------------------------------------------------
+7.3 Validation metrics
+----------------------------------------------------------------------
+
+def compute_val_metrics(pred_rmse, gt_rmse, threshold=15.0):
+    """Compute Tier 1 and Tier 2 evaluation metrics."""
+
+    # Tier 1: TPR/TNR at threshold
+    gt_good = gt_rmse < threshold
+    gt_bad = gt_rmse >= threshold
+    pred_good = pred_rmse < threshold
+
+    tpr = (pred_good & gt_good).sum() / gt_good.sum()
+    tnr = (~pred_good & gt_bad).sum() / gt_bad.sum()
+    balanced_acc = (tpr + tnr) / 2
+
+    # Tier 2: Spearman on gt-good frames
+    if gt_good.sum() > 10:
+        from scipy.stats import spearmanr
+        rho, _ = spearmanr(-pred_rmse[gt_good], -gt_rmse[gt_good])
+    else:
+        rho = float("nan")
+
+    return {"tpr": tpr, "tnr": tnr, "balanced_acc": balanced_acc,
+            "spearman_rho": rho}
+
+
+======================================================================
+TASK 8 — INFERENCE MODULE (inference.py)
+======================================================================
+
+File: flatsam2/nn/inference.py
+
+class NNHomographyScorer:
+    """Ready-to-use inference wrapper for tracker integration.
+
+    Loads a trained model, performs preprocessing, returns
+    (predicted_rmse, sigma) in absolute pixel units.
+    """
+
+    __init__(self, checkpoint_path: str, arch: str = "option_e",
+             device: str = "cuda", n_points: int = 128):
+        self.arch = arch
+        self.device = torch.device(device)
+        self.n_points = n_points
+
+        if arch == "option_e":
+            self.model = BoundaryTransformer()
+        else:
+            self.model = SDFCropCNN()
+
+        state = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(state["model"])
+        self.model.to(self.device)
+        self.model.eval()
+
+    def init_reference(self, ref: ReferenceContour):
+        """Store reference for repeated scoring. Call once per target."""
+        self.ref = ref
+
+    @torch.no_grad()
+    def score(self, mask_B: np.ndarray, H: np.ndarray,
+              image_shape: tuple) → tuple[float, float]:
+        """Score a single homography hypothesis.
+
+        Returns:
+            predicted_rmse: float, estimated corner error in pixels
+            sigma: float, aleatoric uncertainty in pixels
+        """
+        prep = preprocess(self.ref, mask_B, H, image_shape, self.n_points)
+        if prep is None:
+            return float("inf"), float("inf")
+
+        if self.arch == "option_e":
+            feat_A, feat_B = build_option_e_features(prep)
+            feat_A = torch.from_numpy(feat_A).unsqueeze(0).to(self.device)
+            feat_B = torch.from_numpy(feat_B).unsqueeze(0).to(self.device)
+            pred_rmse, log_sigma = self.model(feat_A, feat_B)
+        else:
+            crop, s = build_option_c_input(prep)
+            crop = crop.unsqueeze(0).to(self.device)
+            pred_rmse, log_sigma = self.model(crop)
+            pred_rmse = pred_rmse / s
+            log_sigma = log_sigma - math.log(s)
+
+        rmse = pred_rmse.item()
+        sigma = math.exp(log_sigma.clamp(-5, 5).item())
+        return rmse, sigma
+
+    @torch.no_grad()
+    def rank_hypotheses(self, mask_B: np.ndarray,
+                        H_candidates: list[np.ndarray],
+                        image_shape: tuple) → list[dict]:
+        """Score and rank multiple homography candidates.
+        Returns list sorted by predicted_rmse ascending."""
+        results = []
+        for i, H in enumerate(H_candidates):
+            rmse, sigma = self.score(mask_B, H, image_shape)
+            results.append({"index": i, "H": H,
+                            "predicted_rmse": rmse, "sigma": sigma})
+        results.sort(key=lambda r: r["predicted_rmse"])
+        return results
+
+
+======================================================================
+TASK 9 — TRAINING & EVALUATION
+======================================================================
+
+Run training:
+  python -m flatsam2.nn.train --arch option_e --output-dir checkpoints/option_e
+  python -m flatsam2.nn.train --arch option_c --output-dir checkpoints/option_c
+
+Expected training time: ~4–8 hours per architecture on a single GPU.
+
+Evaluation checklist:
+  - Compare Tier 1 balanced accuracy (target: > 0.90)
+  - Compare Tier 2 Spearman rho (target: > 0.70)
+  - Generate scatter plot: predicted_rmse vs GT corner RMSE
+    with identity line and N_clip=30px line
+  - Compare both architectures against the existing
+    assess_homography() confidence score baseline
+
+Use experiments/homography_quality_eval.py as a template for
+running evaluation on real sequences (POT, PlanarTrack).
+
+
+======================================================================
+TASK 10 — TRACKER INTEGRATION
+======================================================================
+
+File: flatsam2/tracker.py
+
+Integration point: after homography estimation, before returning
+TrackResult.
+
+Changes to FlatSAMTracker:
+
+  __init__:
+    If config specifies nn_scorer_checkpoint:
+      self.nn_scorer = NNHomographyScorer(checkpoint, arch, device)
+    else:
+      self.nn_scorer = None
+
+  init():  (after building ReferenceContour)
+    if self.nn_scorer:
+      self.nn_scorer.init_reference(self.ref_contour)
+
+  _track_impl():  (after RANSAC finds H_candidate)
+    if self.nn_scorer:
+      rmse_pred, sigma = self.nn_scorer.score(
+          seg_mask, H_candidate, image_shape)
+      # Use rmse_pred for accept/reject or ranking
+      # E.g., reject if rmse_pred > 15px, keep last_H instead
+
+Add to TrackerConfig:
+    nn_scorer_checkpoint: Optional[str] = None
+    nn_scorer_arch: str = "option_e"
+
+
+======================================================================
+KEY IMPLEMENTATION NOTES
+======================================================================
+
+1. CONTOUR RESAMPLING TO FIXED N
+   The existing _resample_at_spacing uses fixed spacing (default 2px),
+   giving variable N. For the NN we need fixed N=128.
+   New helper: _resample_to_n_points(pts, n) that computes
+   spacing = total_arc_length / n and delegates to _resample_at_spacing.
+
+2. EMPTY/DEGENERATE MASKS
+   Handle gracefully: if mask_B or mask_A' has < 100 nonzero pixels
+   or no extractable contour, return None from preprocess and
+   inf from score. During training, skip such samples.
+
+3. SDF NORMALISATION
+   SDF values are in absolute pixel units everywhere for Option E.
+   For Option C, SDF values in the crop are multiplied by s (the
+   isotropic scale factor) so they're in crop-pixel units.
+
+4. REPRODUCIBILITY
+   Training: fix all seeds (torch, numpy, python random, CUDA).
+   Validation set: deterministic via fixed seed.
+   Use torch.use_deterministic_algorithms(True) if feasible.
+
+5. CHECKPOINT FORMAT
+   {
+     "model": model.state_dict(),
+     "optimizer": optimizer.state_dict(),
+     "epoch": int,
+     "best_val_loss": float,
+     "config": TrainConfig as dict,
+     "metrics": dict of best validation metrics,
+   }
+
+6. DEVICE HANDLING
+   Training: auto-detect CUDA, fallback to CPU.
+   Inference: match device of tracker (typically CUDA).
+   Preprocessing is numpy/OpenCV (CPU). Only the model forward
+   pass runs on GPU.

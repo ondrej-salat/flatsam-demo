@@ -1,0 +1,25 @@
+"""Keypoint branch without mask focusing -- the paper's sampling ablation.
+
+Identical to ``loma_r_allobj_inflate10`` except that current-frame keypoints are
+sampled over the whole frame instead of inside the tracked mask first. Same
+matcher, same 4096-keypoint budget, same USAC-MAGSAC at 5 px, same exact-GT
+init-frame sampling, so the only difference is where the budget is spent.
+"""
+
+from flatsam2.config import LoMaTrackerConfig, SamplingCfg
+
+config = LoMaTrackerConfig(
+    model="LoMaR",
+    sampling=SamplingCfg(
+        n_object=4096,
+        total_budget=4096,
+        nms_size=3,
+        subpixel=True,
+        subpixel_temp=0.5,
+    ),
+    init_mask_inflate_px=10,
+    current_mask_inflate_px=10,
+    current_mask_sampling=False,
+    ransac_method="USAC_MAGSAC",
+    ransac_threshold=5.0,
+)

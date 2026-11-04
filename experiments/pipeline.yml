@@ -1,0 +1,788 @@
+# Experiment pipeline manifest.
+#
+# Maintained by Claude and opencode — update whenever:
+#   - a new experiment script or SLURM submit script is added
+#   - a new config file is added under configs/
+#   - output directory paths change
+#   - a pipeline's completeness signal changes
+#
+# Consumed by scripts/hpc_status.py to check HPC computation state.
+# Also referenced by /where-am-i and /hpc-status skills.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Path variables — expanded with {VAR} throughout this file.
+# These are the actual paths on the HPC / network storage.
+# ---------------------------------------------------------------------------
+path_variables:
+  OUTPUT_DIRECTORY:      /mnt/personal/serycjon/flatsam2/results
+  LOMA_V2_OUTPUT:        /mnt/personal/serycjon/flatsam2/loma_v2
+  LOMA_TRACKER_OUTPUT:   /mnt/personal/serycjon/flatsam2/loma_tracker
+  COMPARISONS_DIRECTORY: /mnt/personal/serycjon/flatsam2/comparisons
+  POT_BASE:              /mnt/data/vrg/public_datasets/POT-210
+  PT_BASE:               /mnt/data/vrg/public_datasets/PlanarTrack/PlanarTrack-Data
+  POIC_BASE:             /mnt/personal/serycjon/data/POIC
+  TMT_BASE:              /mnt/personal/serycjon/data/TMT
+  UCSB_BASE:             /mnt/personal/serycjon/data/UCSB
+  MPOT_BASE:             /mnt/personal/serycjon/data/MPOT-3K
+
+# ---------------------------------------------------------------------------
+# Datasets — how to discover sequence names on disk.
+#
+#   type: directories  → sorted subdirectory names under `path`
+#   type: text_file    → one sequence name per line in `path`
+# ---------------------------------------------------------------------------
+datasets:
+  pot:
+    label: POT-210
+    sequences:
+      type: directories
+      path: "{POT_BASE}/extracted/images"
+
+  pti:
+    label: PlanarTrackInitfix
+    sequences:
+      type: text_file
+      path: "{PT_BASE}/training-test-splits/test_seq.txt"
+
+  # PlanarTrack's own train split -- where parameters of *our* method may be
+  # swept without selecting on the reported benchmark (see tau_ablation).
+  planartrack_train:
+    label: PlanarTrack
+    sequences:
+      type: text_file
+      path: "{PT_BASE}/training-test-splits/training_set.txt"
+
+  # Planar Objects with Illumination Changes (Ling et al.). 20 sequences.
+  poic:
+    label: POIC
+    sequences:
+      type: directories
+      path: "{POIC_BASE}/sequences"
+      require_file: "{POIC_BASE}/gt/{seq_name}.txt"
+
+  # Tracking benchmark for Manipulation Tasks (Roy et al., ICRA 2015).
+  # 92 sequences: 80 oriented + 4 composite + 8 robot.
+  tmt:
+    label: TMT
+    sequences:
+      type: directories
+      path: "{TMT_BASE}/data/sequences"
+      require_file: "{TMT_BASE}/data/gt/{seq_name}.txt"
+
+  # UCSB (Gauglitz et al., IJCV 2011). 96 sequences = 6 textures x 16 motions.
+  # require_file drops the packaging's auxiliary dirs (OptGT, ReinitGT, SSM, ...).
+  ucsb:
+    label: UCSB
+    sequences:
+      type: directories
+      path: "{UCSB_BASE}"
+      require_file: "{UCSB_BASE}/{seq_name}.txt"
+
+  # MPOT-3K test split (Zhang et al., ICCV 2023). Multi-object: 54 videos expand
+  # to 573 tracking tasks, one per planar instance, named <video>__<instance>.
+  mpot:
+    label: MPOT-3K
+    sequences:
+      type: nested_csv_ids
+      path: "{MPOT_BASE}/list/test.txt"
+      child_path: "{MPOT_BASE}/test/{seq_name}/gt/gt_init.txt"
+      id_column: 1
+      separator: "__"
+
+# ---------------------------------------------------------------------------
+# Pipelines
+#
+# Fields:
+#   name            — identifier; used as filter key for --pipeline flag
+#   description     — human-readable summary
+#   status          — "active" | "experimental" | "legacy"
+#   runner          — local run command template (informational)
+#   slurm           — SLURM submit command template (informational)
+#   datasets        — dataset keys from above (all if omitted)
+#   active_configs  — config paths to check; empty list = no config variant
+#   completeness    — ALL these file templates must exist per-sequence
+#   evaluator       — optional; `output` is checked for existence + mtime
+#
+# Template variables available everywhere:
+#   {VAR}           — anything from path_variables above
+#   {config_stem}   — stem of the active_config path (e.g. "hough_symmetry_only")
+#   {dataset_label} — dataset label (e.g. "POT-210", "PlanarTrackInitfix")
+# Available in completeness paths only:
+#   {seq_name}      — sequence name
+#
+# For pipelines with no config variants, set active_configs to []
+# and omit {config_stem} from completeness paths.
+# For pipelines whose config naming is non-standard, use a literal string
+# in active_configs and treat {config_stem} as that literal.
+# ---------------------------------------------------------------------------
+pipelines:
+
+  # ── Main FlatSAM2 tracker ─────────────────────────────────────────────────
+  - name: flatsam_tracker
+    description: "FlatSAM2 tracker: optical flow + Hough homography + SAM3 segmentation"
+    status: active
+    runner: "python run.py {dataset} --config {config}"
+    slurm:  "python slurm/submit.py {dataset} --config {config} --jobs 10"
+    datasets: [pot, pti]
+    active_configs:
+      - configs/tracker/hough_symmetry_only.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/{seq_name}.txt"
+    evaluator:
+      command: "python evaluate.py {dataset} --results-dir {OUTPUT_DIRECTORY} --config {config}"
+      output:  "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/eval_results.json"
+
+  - name: loma_samh_online
+    description: "Online LoMa + SAM-H inlier-choice tracker with shared SAM3 stream"
+    status: active
+    runner: "python run.py {dataset} --config {config}"
+    slurm:  "python slurm/submit.py {dataset} --config {config} --jobs 10"
+    datasets: [pot, pti]
+    active_configs:
+      - configs/tracker/loma_samh.py
+      - configs/tracker/loma_samh_correct.py
+      - configs/tracker/loma_samh_decoupled.py
+      - configs/tracker/loma_samh_decoupled_candunion.py
+      - configs/tracker/loma_samh_correct_decoupled.py
+      - configs/tracker/loma_samh_correct_decoupled_relaxed.py
+      - configs/tracker/loma_samh_correct_decoupled_inl35.py
+      # UNDER TEST: DINOv2 symmetry vote replaced by keypoint-correspondence
+      # support (symmetry.method='matches'); find_closest_H kept unchanged.
+      - configs/tracker/loma_samh_matchnaming.py
+      - configs/tracker/loma_samh_correct_decoupled_excessdepth.py
+      # Oracle correction grid (E-cells; see docs/correction_research.md).
+      # Oracle/periodic sources need GT — plumbed automatically by run.py.
+      # Grid driver: experiments/run_correction_grid.sh (status|submit|eval|
+      # analyze|auto; auto resubmits until complete, tunable via
+      # JOBS/PACK/TIME/POLL_SECS/MAX_STRIKES env vars).
+      - configs/tracker/loma_samh_correct_decoupled_oracleTC.py       # E1 oracle trigger + oracle content
+      - configs/tracker/loma_samh_correct_decoupled_oracleT.py        # E2 oracle trigger + loma content
+      - configs/tracker/loma_samh_correct_decoupled_oracleC.py        # E3 loma trigger + oracle content
+      - configs/tracker/loma_samh_correct_decoupled_periodic30_oracleC.py  # E5 periodic + oracle content
+      - configs/tracker/loma_samh_correct_decoupled_excessdepth_rerun.py   # E4 deployed correction, fresh telemetry
+      - configs/tracker/loma_samh_correct_decoupled_dryrun.py         # E0+ baseline with dry-run trigger telemetry
+      # P3' prototype: SAM-H via direct mask alignment instead of the Hough quad
+      # (hough.method='align'; Hough kept as rejection fallback).
+      - configs/tracker/loma_samh_decoupled_alignh.py
+      - configs/tracker/loma_samh_decoupled_alignh_pure.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/{seq_name}.txt"
+    evaluator:
+      command: "python evaluate.py {dataset} --results-dir {OUTPUT_DIRECTORY} --config {config}"
+      output:  "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/eval_results.json"
+
+  # ── Corner-level covariance fusion (quad-free thread) ─────────────────────
+  - name: corner_fusion
+    description: "Per-corner precision-weighted fusion of LoMa + SAM-H (align, quad-free), replacing loma_samh's hard inlier-threshold switch. See flatsam2/tracking/corner_fusion.py, docs/correction_research.md sections 9-10, docs/2026-08-07.md."
+    status: experimental
+    runner: "python run.py {dataset} --config {config}"
+    slurm:  "python slurm/submit.py {dataset} --config {config} --jobs 10"
+    datasets: [pot, pti]
+    active_configs:
+      - configs/tracker/corner_fusion_alignh.py                       # uncalibrated covariances
+      - configs/tracker/corner_fusion_alignh_calibrated.py            # empirical loma/samh_cov_scale (n=20 PTi sample)
+      - configs/tracker/corner_fusion_alignh_calibrated_gate6.py      # disagreement_gate re-tuned to nominal chi2(2) 95%
+      - configs/tracker/corner_fusion_alignh_calibrated_gate40.py     # disagreement_gate loosened
+      - configs/tracker/corner_fusion_alignh_redetect.py              # + mask-moment redetection in the aligner
+      - configs/tracker/corner_fusion_register.py                     # SAM-H branch = quad-free propose/refine/verify registration
+      - configs/tracker/corner_fusion_register_kp.py                  # + keypoint branch offered as an extra pose proposal
+      - configs/tracker/corner_fusion_register_noapp.py               # paper ablation: verifier without texture (shape-only)
+      - configs/tracker/corner_fusion_register_final.py               # candidate final: kp + SDF ROI crop + alias shortcut/early exit
+      - configs/tracker/corner_fusion_register_recheck.py             # + alias re-check on the full-resolution winner
+      - configs/tracker/corner_fusion_simple.py                       # score simplification attempt, reverted (costs 0.77pp PTi)
+      - configs/tracker/corner_fusion_simple_norecheck.py             # same without the alias re-check
+      - configs/tracker/corner_fusion_wholeframe.py                   # _final + whole-frame fusion decision
+      - configs/tracker/corner_fusion_naming.py                       # naming on the tuned score (ablation row)
+      - configs/tracker/corner_fusion_simple_naming.py                # plain product score + fusion-time naming (superseded)
+      - configs/tracker/corner_fusion_matchverify.py                  # ablation: NCC deleted -> br_p@15 falls; the texture term cannot go
+      - configs/tracker/corner_fusion_matchncc.py                     # ablation: U/N in the score depresses it below accept_score (br -3.88 pp)
+      - configs/tracker/corner_fusion_aliasname.py                    # ablation: support arbitrates aliases only, alias_shortcut path
+      - configs/tracker/corner_fusion_namecheck.py                    # UNDER TEST: alias_recheck every frame, support-arbitrated
+      - configs/tracker/corner_fusion_occl.py                         # UNDER TEST: mask branch abstains on clean partial views (occlusion screen)
+    completeness:
+      - "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/{seq_name}.txt"
+    evaluator:
+      command: "python evaluate.py {dataset} --results-dir {OUTPUT_DIRECTORY} --config {config}"
+      output:  "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/eval_results.json"
+
+  # ── Cross-dataset generalisation ──────────────────────────────────────────
+  - name: cross_dataset
+    description: >-
+      The same tracker configs run beyond POT-210/PlanarTrack, on POIC, TMT,
+      UCSB and the MPOT-3K test split. POIC/TMT/UCSB share one annotation
+      format (`corners_txt` in flatsam2/datasets.py); MPOT-3K is multi-object,
+      so one video expands to one tracking task per planar instance, named
+      `<video>__<instance>` and started on that instance's first annotated
+      frame. Loader wiring is checked CPU-only by
+      `python experiments/check_new_datasets.py`, which loads every sequence and
+      verifies shapes, first-frame initialisation and annotated coverage.
+      MPOT's official evaluation is the MOT-Challenge MATLAB devkit (MOTA/IDF1/
+      SR on box IoU), and our per-instance corner predictions concatenate into
+      its submission format directly — see docs/journal.md 2026-08-12.
+    status: experimental
+    runner: "python run.py {dataset} --config {config}"
+    slurm:  "python slurm/submit.py {dataset} --config {config} --jobs 10"
+    datasets: [poic, tmt, ucsb, mpot]
+    active_configs:
+      - configs/tracker/loma_samh_matchnaming.py                      # quad-based publication candidate (35-inlier switch + match naming)
+      - configs/tracker/corner_fusion_register_final.py               # best quad-free config (reference version)
+      - configs/tracker/loma_samh_decoupled_rerun.py                  # 35-inlier quad-based switch baseline (DINOv2 naming)
+    completeness:
+      - "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/{seq_name}.txt"
+    evaluator:
+      command: "python evaluate.py {dataset} --results-dir {OUTPUT_DIRECTORY} --config {config}"
+      output:  "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/eval_results.json"
+
+  # ── Legacy baselines (WOFTSAM / SAM-H, from ~/git/flatsam) ────────────────
+  - name: legacy_baselines
+    description: >-
+      The frozen SAM2-based trackers of the previous paper — WOFTSAM
+      (`woftsam_samfallback_nl`) and SAM-H (`sam_H`) — run on flatsam2's
+      datasets so the new benchmarks get the same baselines POT/PTi already have.
+      The trackers stay in the legacy repo (`~/git/flatsam`, whose venv is the
+      one with `sam2` + `kornia`); `experiments/run_legacy.py` drives them with
+      flatsam2's sequence discovery, GT, init corners and output layout, so the
+      predictions are directly comparable and TMT/UCSB/MPOT (which the legacy
+      loaders do not know or load differently) are covered. Results directories
+      are named after the legacy config stem, matching the already-imported POT/
+      PTi runs and `configs/aliases/default.py`.
+    status: active
+    # --mem 48G: the legacy tracker holds a whole sequence of decoded frames in
+    # RAM (a POT sequence is ~3 GB before SAM2 state); 16 G gets OOM-killed.
+    runner: "python experiments/run_legacy.py {dataset} --legacy-config {config}"
+    slurm:  "python slurm/submit.py {dataset} --legacy-config {config} --jobs 10 --mem 48G"
+    datasets: [poic, tmt, ucsb, mpot]
+    active_configs:
+      - ~/git/flatsam/configs/woftsam_samfallback_nl.py               # WOFTSAM (WOFT + SAM2 fallback)
+      - ~/git/flatsam/configs/sam_H.py                                # SAM-H (SAM2 mask -> Hough homography).
+        # The stem names the results directory and the completed runs live under sam_H/.
+        # WACV2026-SAM-H.py is the identical config under current legacy code (journal
+        # 2026-08-15); its same-named directory is an older code state, 0.53 p@15 lower.
+    completeness:
+      - "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/{seq_name}.txt"
+    evaluator:
+      command: "python evaluate.py {dataset} --results-dir {OUTPUT_DIRECTORY} --results-name {config_stem}"
+      output:  "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/eval_results.json"
+
+  # ── Tracker cards (the standalone design record) ──────────────────────────
+  - name: tracker_cards
+    description: >-
+      `docs/tracker-cards.html`: the standalone description of every tracker
+      variant — mechanisms as equations plus the code path, the measured numbers,
+      and the dead ends. Two steps, both CPU-only. `register_visuals.py` runs the
+      deployed mask->H code (`register_mask`, `_gn_align`) on real frames with
+      precomputed SAM3 masks and writes the panels plus `figs_facts.json`;
+      `build_tracker_cards.py` reads those facts and every cited
+      `eval_results.json`, and writes the page with the PNGs inlined as data
+      URIs. No number in the page is transcribed by hand, so re-running both
+      steps after new grids refreshes the document exactly.
+    status: active
+    runner: "python experiments/build_tracker_cards.py --fig-dir {COMPARISONS_DIRECTORY}/reports/figs_pti"
+    slurm:  "python slurm/submit_cmd.py --gpus 0 --no-mail -- python experiments/register_visuals.py --dataset pti --sequence Seq_00006 --frame 30 --fusion-frame 30 --out-dir {COMPARISONS_DIRECTORY}/reports/figs_pti"
+    datasets: [pti]
+    completeness:
+      - "{COMPARISONS_DIRECTORY}/reports/figs_pti/figs_facts.json"
+      - "{COMPARISONS_DIRECTORY}/reports/figs_pti/fig_fusion.png"
+
+  # ── LoMa v2 (active research) ─────────────────────────────────────────────
+  - name: loma_v2
+    description: "LoMa feature-matching tracker v2 with SAM3 masks and keypoint stats"
+    status: active
+    runner: "python experiments/loma_experiment_v2.py {dataset} --config {config} --output-dir {LOMA_V2_OUTPUT}"
+    slurm:  "python slurm/submit_loma_v2.py {dataset} --config {config} --jobs 10"
+    datasets: [pot, pti]
+    active_configs:
+      - configs/loma/loma_r_allobj_inflate10.py                       # deployed keypoint branch
+      - configs/loma/loma_r_allobj_nomask.py                          # paper ablation: same budget, mask focusing off
+    completeness:
+      - "{LOMA_V2_OUTPUT}/{config_stem}/{dataset_label}/{seq_name}.txt"
+      - "{LOMA_V2_OUTPUT}/{config_stem}/{dataset_label}/{seq_name}.npz"
+      - "{LOMA_V2_OUTPUT}/{config_stem}/{dataset_label}/{seq_name}_stats.json"
+
+  # ── SAM3 multi-candidate mask dump ────────────────────────────────────────
+  - name: sam3_candidate_dump
+    description: "Dump every SAM3 streaming-tracker candidate mask per frame (segmentation only, no tracking) for offline exploration"
+    status: active
+    runner: "python run.py {dataset} --config {config}"
+    # Segmentation-only: no corner predictions, so submit with --no-eval.
+    slurm:  "python slurm/submit.py {dataset} --config {config} --jobs 10 --no-eval"
+    datasets: [pot, pti]
+    active_configs:
+      - configs/tracker/sam3_candidates.py
+    # Per sequence: masks/<seq>/{frame+1:05d}.png (selected), _c{k}.png (candidates),
+    # and ious.json (written last = completeness signal).
+    completeness:
+      - "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/masks/{seq_name}/ious.json"
+    evaluator: null
+
+  # ── SAM3 mask quality metrics precomputation ──────────────────────────────
+  - name: mask_metrics
+    description: "Precompute SAM3 mask quality per frame: IoU, boundary hit-rate, Chamfer distance"
+    status: active
+    runner: "python experiments/pti_sam3_mask_metrics.py"
+    slurm:  null
+    datasets: [pti]
+    active_configs: []
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/pti_sam3_mask_metrics/per_sequence/{seq_name}.csv"
+    evaluator:
+      command: null
+      output:  "{OUTPUT_DIRECTORY}/experiments/pti_sam3_mask_metrics/summary.json"
+
+  # ── Mask quality vs tracker error report ─────────────────────────────────
+  - name: mask_homography_report
+    description: "Interactive scatter/heatmap: SAM3 mask quality vs tracker alignment error"
+    status: active
+    runner: "python experiments/pti_sam3_mask_homography_report.py"
+    slurm:  null
+    datasets: [pti]
+    # No per-sequence output; single HTML file regardless of config.
+    # active_configs documents the default tracker config used as input.
+    active_configs:
+      - configs/tracker/hough_symmetry_only.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/pti_sam3_mask_homography_report/mask_metric_vs_alignment_error.html"
+    evaluator: null
+
+  # ── SAM over-seg correction feasibility study ────────────────────────────
+  - name: sam_overseg_correction
+    description: "Feasibility of SAM3 over-seg correction by LoMa H: per-frame mask-vs-GT/corr features + HTML report with 2x3 table and trigger PR sliders"
+    status: experimental
+    # Input substrate: the no-correction loma_samh_decoupled_rerun run (deterministic;
+    # {seq}_debug.npz) + precomputed SAM3 masks. dump = heavy mask IO (HPC); report = HTML.
+    runner: "python experiments/sam_overseg_correction.py dump --results-dir {OUTPUT_DIRECTORY}/loma_samh_decoupled_rerun/{dataset_label}"
+    # No dedicated submitter; use the generic slurm/submit_cmd.py one-off wrapper
+    # (activates .envrc, runs an arbitrary command, no sequence splitting). e.g.
+    #   python slurm/submit_cmd.py --job-name overseg-dump -- \
+    #     python experiments/sam_overseg_correction.py dump
+    slurm:  null
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_decoupled_rerun.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/sam_overseg_correction/per_sequence/{seq_name}.csv"
+    evaluator:
+      command: "python experiments/sam_overseg_correction.py report"
+      output:  "{OUTPUT_DIRECTORY}/experiments/sam_overseg_correction/report.html"
+      # Pass --config <deployed correction config> to add the expected-vs-actual
+      # localization toggle: where the correction actually fired (corrected run's
+      # {seq}_debug.npz) and where it helped/harmed corner error vs --baseline-dir.
+      # e.g. report --config configs/tracker/loma_samh_correct_decoupled_excessdepth.py
+      #
+      # The `compare` subcommand diffs that run's live SAM3 masks (saved at
+      # <run_dir>/masks/<seq>/) against the precomputed substrate the study assumed;
+      # pre-fire IoU < 1 means the study analysed masks the real run never saw.
+      # e.g. compare --config configs/tracker/loma_samh_correct_decoupled_excessdepth.py
+
+  # ── Correction error-budget analysis (A0, offline) ───────────────────────
+  - name: correction_headroom
+    description: "Offline error budget for the oracle-correction study: per-frame candidate errors vs GT, selection ceiling, spill/shrink/jump taxonomy, deep-dive shortlist"
+    status: experimental
+    # Substrate: existing loma_samh_decoupled_rerun run ({seq}_debug.npz + {seq}.txt)
+    # + precomputed SAM3 masks; no tracker rerun needed. dump = mask IO (HPC);
+    # report = HTML + shortlist subset file.
+    runner: "python experiments/correction_headroom.py dump"
+    slurm:  null
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_decoupled_rerun.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/correction_headroom/{dataset_label}/per_sequence/{seq_name}.csv"
+    evaluator:
+      command: "python experiments/correction_headroom.py report"
+      output:  "{OUTPUT_DIRECTORY}/experiments/correction_headroom/{dataset_label}/report.html"
+
+  # ── Correction event-conditional analysis (A2, offline) ──────────────────
+  - name: correction_events
+    description: "Paired event-conditional analysis of a correction run vs its no-correction baseline: post-event error deltas, persistence, re-trigger intervals"
+    status: experimental
+    # One report per corrected config; pass --config <E-cell config>. Single-shot
+    # analysis, completeness = the html.
+    runner: "python experiments/correction_events.py --config {config}"
+    slurm:  null
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_correct_decoupled_oracleTC.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/correction_events/{config_stem}/{dataset_label}/report.html"
+    evaluator: null
+
+  # ── Candidate-selector study (S1, offline) ───────────────────────────────
+  - name: selector_study
+    description: "Online-feature candidate selection (loma_H vs samh_H): feature AUCs + threshold-rule frontier vs the A0 selection ceiling, sequence-level train/test split"
+    status: experimental
+    # Substrate: the E0+ dry-run run's {seq}_debug.npz (corr_* telemetry +
+    # candidate H's) + GT. No mask IO — login-node friendly, no SLURM needed.
+    runner: "python experiments/selector_study.py dump"
+    slurm:  null
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_correct_decoupled_dryrun.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/selector_study/{dataset_label}/per_sequence/{seq_name}.csv"
+    evaluator:
+      command: "python experiments/selector_study.py report"
+      output:  "{OUTPUT_DIRECTORY}/experiments/selector_study/{dataset_label}/report.html"
+
+  # ── Catastrophic-LoMA breakdown gallery (offline list + GPU render) ──────
+  - name: loma_breakdown_gallery
+    description: "List + visualize loma-selected catastrophic frames (high inliers, wrong H): sampling-mask tint, matches/inliers, GT vs candidate quads, HTML gallery"
+    status: experimental
+    # list = selector_study CSVs -> ranked breakdown_frames.csv (login node);
+    # render = recompute LoMA matches/RANSAC per frame (GPU; submit_cmd one-off).
+    runner: "python experiments/loma_breakdown_gallery.py list"
+    slurm:  null
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_decoupled_rerun.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/loma_breakdowns/{dataset_label}/breakdown_frames.csv"
+    evaluator:
+      command: "python experiments/loma_breakdown_gallery.py render"
+      output:  "{OUTPUT_DIRECTORY}/experiments/loma_breakdowns/{dataset_label}/index.html"
+
+  # ── Unbiased breakdown tagging round (list + stratified sample + GPU render) ─
+  - name: loma_breakdown_sample
+    description: "Disagreement-stratified random sample of the breakdown frames, rendered as an annotatable gallery: tag counts that scale back to class shares (the ranked list cannot)"
+    status: experimental
+    # One driver does list -> sample -> submit render. Tags are exported from the
+    # browser and saved as loma_tags.json next to the ranked list.
+    runner: "experiments/run_breakdown_sample.sh"
+    slurm:  "experiments/run_breakdown_sample.sh"
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_decoupled_rerun.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/loma_breakdowns/{dataset_label}_sample/index.html"
+    evaluator: null
+
+  # ── Stateful candidate selection (S1 v3, offline) ────────────────────────
+  - name: selection_state
+    description: "Episode-level candidate selection: run-length structure of LoMA breakdowns, onset-vs-sustained feature AUCs, latch rule frontier at P@5/15/30, failure-tag join"
+    status: experimental
+    # Substrate: the selector_study per-sequence CSVs (+ optional loma_tags.json).
+    # No GPU, no dataset access, no flags — login node, single command.
+    runner: "python experiments/selection_state.py"
+    slurm:  null
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_correct_decoupled_dryrun.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/selection_state/{dataset_label}/report.html"
+    evaluator: null
+
+  # ── Fusion / branch diagnostics (offline, stdout-only) ───────────────────
+  - name: fusion_diagnostics
+    description: "Offline read-outs of an existing corner_fusion run's debug npz + GT: per-branch P@k (branch_p_at_k), covariance calibration (fusion_calibration_check), coasted-estimate staleness (coast_covariance_study), accepted-but-wrong align anatomy (samh_accept_study), and exact re-fusion under alternative rules (fusion_rule_replay -- both branches are decoupled from the fused output, so a replay reproduces what the tracker would have produced; --out-json writes the per-rule pooled p@15 the tracker cards read), plus which naming rule a finished run's stored correspondence histograms actually favour (naming_rule_replay: recomputes the truncated support exactly at any bin-edge tau and scores tau/margin/abstain combinations against the naming GT would pick -- the decision only, not an end-to-end replay, since naming inside the verifier changes what the branch returns), plus where corner *naming* goes wrong and whether the keypoint branch can repair it (naming_diagnosis: mis-named frames by fusion mode, whether LoMa's own naming is GT's, and the fix/break count of relabelling to the rotation nearest LoMa -- it motivated fusion.keypoint_naming_margin, whose end-to-end effect fusion_rule_replay then measures exactly). See docs/2026-08-07.md, 2026-08-11 entries, and docs/journal.md 2026-08-17 for the whole_frame decision scope it settled."
+    status: experimental
+    # Each is a one-shot read-out printing to stdout (no artifacts on disk):
+    # run whichever question you have, read the slurm log. Imports cv2, so it
+    # goes to the cpu partition rather than the login node.
+    runner: "python experiments/branch_p_at_k.py {dataset} --config {config} [--split test]"
+    slurm:  "python slurm/submit_cmd.py --gpus 0 -- python experiments/branch_p_at_k.py {dataset} --config {config}"
+    datasets: [pot, pti]
+    active_configs:
+      - configs/tracker/corner_fusion_alignh_calibrated.py
+      - configs/tracker/corner_fusion_alignh_redetect.py
+    # Read-outs produce no artifacts, so "complete" here means the substrate
+    # they need is on disk: the per-sequence debug telemetry of the run above.
+    completeness:
+      - "{OUTPUT_DIRECTORY}/{config_stem}/{dataset_label}/{seq_name}_debug.npz"
+    evaluator: null
+
+  # ── Cross-dataset failure anatomy (offline, no GPU) ──────────────────────
+  - name: ucsb_failures
+    description: >-
+      Why UCSB is the one dataset where legacy WOFTSAM beats both current
+      trackers. Reads the UCSB eval JSONs and per-sequence corner predictions
+      already on disk: whether the gap is concentrated (it is -- 19 of 96
+      sequences, worst 5 carry 60%), which categories carry it (unconstrained,
+      perspective), whether failing frames are mis-scaled or displaced (the
+      mask-based trackers run ~18% too large on failures, WOFTSAM does not).
+      Diagnostic PNGs draw GT and tracker predictions. Publication mode instead
+      draws GT in template/current panels and the saved SAM3 mask only in the
+      current panel, isolating the segmentation-scope example without prediction
+      overlays. Aggregate failures also include inaccurate mask-to-pose fitting.
+    status: experimental
+    runner: "python experiments/ucsb_failures.py --paper"
+    slurm:  "python slurm/submit_cmd.py --gpus 0 --no-mail -- python experiments/ucsb_failures.py --paper"
+    datasets: [ucsb]
+    active_configs: []
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/ucsb_failures/bricks_perspective__f00044.png"
+    evaluator: null
+
+  # ── Mask-right / pose-wrong failure figure (offline, no GPU) ────────────
+  - name: mask_pose_failure
+    description: >-
+      The mask branch's failure mode that mask quality cannot predict: SAM3
+      segments the visible target correctly and the quadrilateral fitted to that
+      silhouette is still hundreds of pixels off, because an occluder or the
+      image border truncated it. Scan mode reads the shipped run's stored branch
+      homographies (loma_H, samh_H) and lists POT frames where the mask branch is
+      far from GT while the keypoint branch is on it; --panels renders those
+      frames for the paper; --stages replays the Hough pipeline per frame and
+      reports lines kept, surviving corner intersections and which transformation
+      the branch fell back to. That last mode is what the paper's mechanism claim
+      rests on: line extraction succeeds (three edges within 2 px) and the pose is
+      lost by the four-corner requirement. Masks are not stored by a normal run,
+      so the figure needs the --save-masks re-run under maskpose_maskdump below.
+    status: active
+    runner: "python experiments/mask_pose_failure.py"
+    slurm: >-
+      python slurm/submit_cmd.py --gpus 0 --no-mail -- python
+      experiments/mask_pose_failure.py --panels V22_5:171 V29_3:251
+      --results-dir {OUTPUT_DIRECTORY}/maskpose_maskdump
+      --masks-dir {OUTPUT_DIRECTORY}/maskpose_maskdump/loma_samh_matchnaming/POT-210/masks
+    datasets: [pot]
+    active_configs:
+      - configs/tracker/loma_samh_matchnaming.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/maskpose_maskdump/loma_samh_matchnaming/POT-210/masks/V22_5"
+      - "{OUTPUT_DIRECTORY}/maskpose_maskdump/experiments/mask_pose_failure/V22_5_f00171__V29_3_f00251.png"
+    evaluator: null
+
+  # ── Fixed positive paper examples (offline, no GPU) ─────────────────────
+  - name: paper_examples
+    description: >-
+      Positive PlanarTrack qualitative figure for the WACV paper. Uses four
+      examples inherited from the previous paper's qualitative set and reads
+      completed FlatSAM2 corner predictions; no tracking or test-set search is
+      performed.
+    status: active
+    runner: "python experiments/paper_examples.py"
+    slurm: "python slurm/submit_cmd.py --gpus 0 --no-mail -- python experiments/paper_examples.py"
+    datasets: [pti]
+    active_configs:
+      - configs/tracker/loma_samh_matchnaming.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/paper_examples/pti_positive.png"
+    evaluator: null
+
+  - name: paper_overview
+    description: >-
+      Static FlatSAM2 method diagram used by the WACV paper. Encodes shared
+      masks, two independent pose states, raw-match corner naming and the final
+      inlier-count selection rule; reads no experiment outputs.
+    status: active
+    runner: "python experiments/paper_overview.py"
+    slurm: null
+    datasets: [pti]
+    active_configs: []
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/paper_overview/overview.pdf"
+    evaluator: null
+
+  # ── Switch-threshold sensitivity (offline, no GPU) ───────────────────────
+  - name: inlier_threshold_sweep
+    description: >-
+      Is the quad-based tracker's `inliers >= 35` switch a tuned constant? Reads
+      each run's stored branch homographies and inlier counts, reconstructs the
+      rule and sweeps the threshold. Self-checks against the run's own
+      `selected` array before reporting (100.00% agreement on PTi and POT, and
+      pooled P@15 at T=35 reproduces the recorded 88.05 / 98.51). Result
+      (docs/journal.md 2026-08-19): T=35 sits on a broad plateau -- PTi moves
+      0.25 pp over T in [25, 80], POT does not move -- so the number is not
+      load-bearing. It does not address the per-frame cliff objection, which is
+      what the corner_fusion branch exists for. Prints to stdout; no artifact.
+    status: experimental
+    runner: "python experiments/inlier_threshold_sweep.py {dataset} --config {config}"
+    slurm:  "python slurm/submit_cmd.py --gpus 0 --no-mail -- python experiments/inlier_threshold_sweep.py {dataset} --config {config}"
+    datasets: [pti, pot]
+    active_configs:
+      - configs/tracker/loma_samh_matchnaming.py
+    completeness: []
+    evaluator: null
+
+  # ── tau sensitivity of the corner namer (train split) ────────────────────
+  - name: tau_ablation
+    description: >-
+      Is `symmetry.match_tau_px = 30` a tuned constant? Unlike the inherited
+      35-inlier threshold, tau is this method's own parameter, so it is swept on
+      the PlanarTrack **train** split (`configs/subsets/pt_trn_50.txt`) -- a sweep
+      on the reported test benchmark would be selecting on test. The tracking
+      re-run exists only to record telemetry the published grid does not have:
+      `naming_hist_counts` / `naming_hist_sumsq` were written by the registrar
+      path only until 2026-08-25 (commit 55f63b9), so on the deployed `hough`
+      path they were structurally zero. With them the truncated support
+      `sum max(0, 1 - d^2/tau^2)` is recoverable exactly at every swept bin edge
+      (3, 5, 7, 10, 15, 20, 30, 50, 100 px), so `experiments/naming_rule_replay.py`
+      scores every tau -- plus margin, effective-support, and raw-match guards --
+      offline with no GPU. Tau sweeps retain the deployed eight-match minimum;
+      raw-match sensitivity is reported separately at the deployed tau.
+      Written to a separate output root so it cannot touch the published grid.
+      The claim is the flatness, never the argmax (docs/journal.md 2026-08-19,
+      "split hygiene on the threshold sweep").
+    status: active
+    runner: "python run.py planartrack --split train --subset pt_trn_50 --config {config} --output-dir {OUTPUT_DIRECTORY}/tau_ablation"
+    slurm:  "python slurm/submit.py planartrack --split train --subset pt_trn_50 --config {config} --output-dir {OUTPUT_DIRECTORY}/tau_ablation --jobs 50 --time 1:30:00 --partition amdgpu,gpu --no-mail"
+    datasets: [planartrack_train]
+    sequence_subset: configs/subsets/pt_trn_50.txt
+    active_configs:
+      - configs/tracker/loma_samh_matchnaming.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/tau_ablation/{config_stem}/{dataset_label}/{seq_name}_debug.npz"
+    evaluator:
+      command: "python experiments/naming_rule_replay.py planartrack --split train --config {config} --results-dir {OUTPUT_DIRECTORY}/tau_ablation"
+      output:  null
+
+  # ── Cross-hardware reproducibility ───────────────────────────────────────
+  - name: determinism_check
+    description: >-
+      What does a re-run of the shipped config reproduce? Measured 2026-08-25:
+      two runs on the same node are bit-identical (`ransac_seed` is fixed), but a
+      run on a different GPU generation (V100 `gpu` vs the grid's A100 `amdgpu`)
+      diverges from frame 1 and by up to 1494 px, moving per-sequence P@15 by
+      -0.60 / -0.33 / +2.23 pp on three sequences -- SAM3/LoMa kernels differ and
+      the tracker is autoregressive. Consequence: grids must be compared in
+      aggregate, never cell-by-cell across partitions. The 20-sequence re-run
+      (`pti_fusion_probe20`) gives the paper's reproducibility sentence an
+      aggregate figure; `$OUTPUT_DIRECTORY/scratch/det_impact.py` prints the
+      per-sequence table against the published grid.
+    status: active
+    runner: "python run.py pti --subset pti_fusion_probe20 --config {config} --output-dir {OUTPUT_DIRECTORY}/determinism_check/probe20 --no-skip-completed"
+    slurm:  "python slurm/submit.py pti --subset pti_fusion_probe20 --config {config} --output-dir {OUTPUT_DIRECTORY}/determinism_check/probe20 --jobs 20 --time 1:30:00 --partition amdgpu,gpu --no-mail --no-skip-completed --no-eval"
+    datasets: [pti]
+    sequence_subset: configs/subsets/pti_fusion_probe20.txt
+    active_configs:
+      - configs/tracker/loma_samh_matchnaming.py
+    completeness:
+      - "{OUTPUT_DIRECTORY}/determinism_check/probe20/{config_stem}/{dataset_label}/{seq_name}.txt"
+    evaluator: null
+
+  # ── Mask -> homography estimator benchmark (offline, no GPU) ─────────────
+  - name: maskh_bench
+    description: >-
+      Fixed offline test set for the SAM-H branch's core question (template
+      silhouette + this frame's mask -> where is the object?), with the
+      *initialization* as a controlled variable: good (GT + 5 px), drift (GT +
+      30 px), lost (another frame's GT pose), cold (the template pose). Every
+      estimator sees byte-identical inputs, so a comparison costs minutes
+      instead of a full tracking grid, and recovery ability is separated from
+      alignment accuracy. Sequences are split dev/test by name hash — tune on
+      dev, report on test. See docs/2026-08-07.md (2026-08-11 entries).
+    status: active
+    # Substrate: the sam3_candidate_dump masks + dataset GT + frames. No GPU and
+    # no tracker rerun, but it imports cv2, so it goes to the cpu partition.
+    runner: "python experiments/maskh_bench.py build && python experiments/maskh_bench.py run"
+    slurm: >-
+      python slurm/submit_cmd.py --gpus 0 --cpus 16 -- python experiments/maskh_bench.py
+      run --methods hough align_redetect register --out results.csv
+    datasets: [pot, pti]
+    # Estimators are named inside the script (METHODS + mask_register.bench_methods),
+    # not by config file, so there is no config variant to list.
+    active_configs: []
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/maskh_bench/testset_v1.json"
+    evaluator:
+      command: "python experiments/maskh_bench.py run --split test"
+      output:  "{OUTPUT_DIRECTORY}/experiments/maskh_bench/register_test.csv"
+    # Paper ablation table: every `abl_*` method in mask_register.bench_methods()
+    # is one axis (verifier evidence, proposal source, arbitration, refinement
+    # depth, raster resolution, occlusion trimming), run over one pass of the
+    # held-out split:
+    #   python experiments/maskh_bench.py run --split test \
+    #     --extra-h-run corner_fusion_register --out ablations_test.csv
+
+  # ── Paper experiments: timing and result tables (offline, no GPU) ────────
+  - name: paper_tables
+    description: >-
+      The non-tracking experiments a write-up needs, all read off completed
+      runs so nothing is recomputed. `maskh_timing` is the publishable cost
+      measurement: one process, one thread (cv2 and BLAS both pinned), warm-up
+      discarded, median of repeated trials, plus the registrar's internal stage
+      breakdown via flatsam2.profiling — the maskh_bench `ms` column is 16-way
+      contended and only its ratios are meaningful. `results_tables` formats
+      the headline precision table, the POT-210 per-condition breakdown (read
+      from the dataset's own splits/*.txt, not guessed from name suffixes), and
+      accuracy against SAM3 mask quality. Ablations themselves are methods
+      inside maskh_bench (see the `maskh_bench` pipeline, prefix `abl_`).
+    status: active
+    runner: "python experiments/maskh_timing.py && python experiments/results_tables.py"
+    slurm: >-
+      python slurm/submit_cmd.py --gpus 0 --cpus 4 -- python experiments/maskh_timing.py
+      --cases 150 --repeats 3 --stages
+    datasets: [pot, pti]
+    active_configs: []
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/maskh_bench/timing.json"
+    evaluator: null
+
+  # ── Mask-alignment convergence-basin study (P3', offline) ────────────────
+  - name: mask_alignment_basin
+    description: "Convergence basins of direct template-mask -> SAM-mask homography alignment under structured GT perturbations (translation/rotation/scale/shear/tilt/corner-noise)"
+    status: experimental
+    runner: "python experiments/mask_alignment_basin.py dump"
+    slurm:  null
+    datasets: [pti]
+    active_configs: []
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/mask_alignment_basin/{dataset_label}/per_sequence/{seq_name}.csv"
+    evaluator:
+      command: "python experiments/mask_alignment_basin.py report"
+      output:  "{OUTPUT_DIRECTORY}/experiments/mask_alignment_basin/{dataset_label}/report.html"
+
+  # ── LoMa RANSAC tracker (earlier version) ────────────────────────────────
+  - name: loma_tracker
+    description: "LoMa feature-matching tracker: RANSAC homography (pre-v2, uses precomputed NPZ)"
+    status: legacy
+    runner: "python experiments/loma_tracker.py {dataset} --model {model} --ransac {ransac}"
+    slurm:  "python slurm/submit_loma_tracker.py {dataset} --model LoMaB --ransac RANSAC --jobs 20"
+    datasets: [pot, pti]
+    # config naming is "{model}__{ransac}" (e.g. "LoMaB__RANSAC")
+    # use active_configs as literal combo strings; {config_stem} expands accordingly
+    active_configs:
+      - LoMaB__RANSAC
+    completeness:
+      - "{LOMA_TRACKER_OUTPUT}/{config_stem}/{dataset_label}/{seq_name}.txt"
+    evaluator: null
+
+  # ── NN homography quality predictor ──────────────────────────────────────
+  - name: nn_quality_generate
+    description: "Synthetic dataset generation for NN homography quality predictor"
+    status: experimental
+    runner: "python flatsam2/nn/generate_dataset.py --output-dir /mnt/personal/serycjon/flatsam2/nn_cache"
+    slurm:  "python slurm/submit_generate.py --output-dir /mnt/personal/serycjon/flatsam2/nn_cache --n-samples 500000"
+    datasets: []
+    active_configs: []
+    # No per-sequence completeness; check for dataset manifest file
+    completeness:
+      - "/mnt/personal/serycjon/flatsam2/nn_cache/manifest.json"
+    evaluator: null
+
+  - name: nn_quality_train
+    description: "Train NN homography quality score predictor"
+    status: experimental
+    runner: "python flatsam2/nn/train.py --arch option_e --output-dir checkpoints/nn_quality"
+    slurm:  "python slurm/submit_train.py --arch option_e --output-dir checkpoints/nn_quality"
+    datasets: []
+    active_configs: []
+    completeness:
+      - "checkpoints/nn_quality/best_model.pt"
+    evaluator: null
+
+  # ── Covariance demo export (offline, no GPU) ─────────────────────────────
+  - name: covariance_demo
+    description: >-
+      Per-frame *inputs* of both covariance estimators, exported for an
+      interactive page that recomputes sigma^2 (J^T W J)^-1 in the browser:
+      the keypoint branch's RANSAC inliers (re-run offline from the stored LoMa
+      matches, same USAC_MAGSAC seed/threshold as the tracker) and the mask
+      branch's template boundary plus the frame's SAM3 mask. `scan` ranks frames
+      by how much the four per-corner sigmas differ; `export` writes the payload.
+      Substrate is the loma_v2 npz + sam3_candidate_dump masks, so it needs no
+      GPU and no tracker rerun. Cross-checking the export under node is what
+      surfaced the xy-major/corner-major block-slicing bug in
+      mask_align._corner_cov_from_boundary_fit (docs/journal.md 2026-08-18).
+    status: experimental
+    runner: "python experiments/covariance_demo_export.py export --frames V01_5:106 --out demo.json"
+    slurm: >-
+      python slurm/submit_cmd.py --gpus 0 --no-mail -- python
+      experiments/covariance_demo_export.py export --frames V01_5:106 --out demo.json
+    datasets: [pot]
+    active_configs: []
+    completeness:
+      - "{OUTPUT_DIRECTORY}/experiments/covariance_demo/demo.json"
+    evaluator: null

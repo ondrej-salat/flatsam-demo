@@ -1,0 +1,56 @@
+\usepackage{microtype}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{pifont}
+\usepackage{xspace}
+
+\graphicspath{{figures/}}
+
+\newcommand{\citodo}{\textcolor{BrickRed}{[citation missing]}}
+\newcommand{\mat}[1]{\mathbf{#1}}
+\newcommand{\vect}[1]{\mathbf{#1}}
+\newcommand{\method}[1]{\mbox{\textsc{#1}}}
+\newcommand{\dataset}[1]{\mbox{\textsc{#1}}}
+\newcommand{\flatsam}{\method{FlatSAM2}\xspace}
+\newcommand{\samh}{\mbox{SAM-H}\xspace}
+\newcommand{\woftsam}{\mbox{WOFTSAM}\xspace}
+\newcommand{\loma}{\mbox{LoMa}\xspace}
+\newcommand{\pttst}{PT\textsubscript{TST}\xspace}
+\newcommand{\brgap}{\ensuremath{\Delta_{\mathrm{BR}}}}
+\newcommand{\bftab}{\fontseries{b}\selectfont}
+\newcommand{\frst}[1]{{\bftab#1}}
+\newcommand{\scnd}[1]{\underline{#1}}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\textcolor{gray}{\ding{55}}}
+
+% Shared paper-figure color key; RGB values match experiments/paper_colors.py.
+\definecolor{gtcolor}{RGB}{0,190,90}
+\definecolor{flatsamcolor}{RGB}{220,45,120}
+\definecolor{woftsamcolor}{RGB}{30,130,230}
+\definecolor{sam3color}{RGB}{255,100,0}
+\definecolor{maskposecolor}{RGB}{130,60,230}
+
+% Paper-only, supplementary-only, and combined build support.
+\newif\ifcombined
+\combinedtrue
+\newcommand{\xref}[2]{\ifcombined#1\else#2\fi}
+
+% `lineno`'s switch option follows page parity, which puts one two-column
+% ruler in the gutter. Select the outer margin from the active column instead.
+\makeatletter
+\iftoggle{wacvfinal}{}{%
+    \renewcommand\makeLineNumber{%
+        \if@firstcolumn
+            \makeLineNumberLeft
+        \else
+            \makeLineNumberRight
+        \fi
+    }%
+}
+\makeatother
+
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}

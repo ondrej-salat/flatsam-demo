@@ -28,7 +28,6 @@ from flatsam2.datasets import (
     make_image_paths,
     warp_corners,
 )
-from flatsam2.homography_quality import homography_from_corners
 from flatsam2.path_config import paths
 from flatsam2.reproducibility import save_run_info
 from flatsam2.tracker import _DEBUG_CANDIDATES, FlatSAMTracker, TrackResult
@@ -107,7 +106,7 @@ def _gt_homographies(
     for t in range(len(gt_corners)):
         H = None
         if bool(valid[0]) and bool(valid[t]):
-            H = homography_from_corners(gt_corners[0], gt_corners[t])
+            H = match_naming.homography_from_corners(gt_corners[0], gt_corners[t])
             if H is not None and not _is_valid_homography(H):
                 H = None
         homographies.append(H)

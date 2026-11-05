@@ -450,16 +450,3 @@ def bootstrap_corner_covs(
         return None
     samples = np.stack(warped)  # (B, 2, 4)
     return np.stack([np.cov(samples[:, :, k], rowvar=False) for k in range(4)])
-
-
-def mahalanobis_sq(delta: np.ndarray, cov: np.ndarray) -> float:
-    """Squared Mahalanobis distance of a 2-vector under a 2x2 covariance.
-
-    Under a correct Gaussian model this is chi-square with 2 degrees of freedom:
-    median 1.386, and 5% of frames above 5.99.  That is the whole calibration
-    check, and the same quantity turns the branches' raw pixel disagreement into
-    a scale-free one (pass the difference of the two corner estimates and the sum
-    of their covariances).
-    """
-    cov_reg = cov + np.eye(2) * 1e-9
-    return float(delta @ np.linalg.solve(cov_reg, delta))

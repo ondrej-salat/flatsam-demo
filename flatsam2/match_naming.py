@@ -117,19 +117,6 @@ def support_from_residuals(residuals: np.ndarray, tau_px: float) -> float:
     return float(np.maximum(0.0, 1.0 - (residuals / tau_px) ** 2).sum())
 
 
-def match_support(
-    H: np.ndarray,
-    pts_src: np.ndarray,
-    pts_dst: np.ndarray,
-    tau_px: float,
-) -> Optional[float]:
-    """Effective matches explained by ``H``; None when it cannot be measured."""
-    residuals = match_residuals(H, pts_src, pts_dst)
-    if residuals is None:
-        return None
-    return support_from_residuals(residuals, tau_px)
-
-
 def residual_histogram(residuals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Counts and per-bin sums of squared residuals over :data:`RESIDUAL_BIN_EDGES`.
 

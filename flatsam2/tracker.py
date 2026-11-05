@@ -31,9 +31,7 @@ from flatsam2.tracking.common import (
     _CANDIDATE_REDETECTION_FLOW,
     _CANDIDATE_SAMH,
     _DEBUG_CANDIDATES,  # noqa: F401  re-exported for `from flatsam2.tracker import _DEBUG_CANDIDATES`
-    _MASK_H_SOURCE_ALIGN,
     _MASK_H_SOURCE_HOUGH,
-    _MASK_H_SOURCE_REGISTER,
     CandidateScore,
     CorrectionTelemetry,
     MaskHTelemetry,
@@ -121,18 +119,7 @@ class FlatSAMTracker:
         self._corr_telemetry = CorrectionTelemetry()
         # Per-frame mask-H estimator observables (align vs Hough acceptance).
         self._maskh_telemetry = MaskHTelemetry()
-        # Template contour for the align mask-H method; constant per sequence.
-        self._align_boundary: Optional[np.ndarray] = None
-        self._register_template = None
-        # Per-frame extra pose proposals for the register mask-H method, set by
-        # the caller (corner_fusion hands over the keypoint branch's H). Cleared
-        # after each use so a stale proposal never leaks into the next frame.
-        self._register_extra_H: tuple = ()
         self._loma_last_matches: Optional[tuple] = None
-        # Raw correspondences handed *in* to this tracker's registrar. On the
-        # decoupled path the SAM-H sub-tracker is a separate instance, so the
-        # owner sets this on it the same way it sets _register_extra_H.
-        self._register_matches: Optional[tuple] = None
         # Per-frame override for LoMa keypoint sampling (candidate-union densify).
         # None keeps the selected SAM3 mask as the sampling region.
         self._loma_densify_mask: Optional[np.ndarray] = None
@@ -235,11 +222,7 @@ class FlatSAMTracker:
         self._oracle_H = None
         self._corr_telemetry = CorrectionTelemetry()
         self._maskh_telemetry = MaskHTelemetry()
-        self._align_boundary = None
-        self._register_template = None
-        self._register_extra_H = ()
         self._loma_last_matches = None
-        self._register_matches = None
 
         # Initialize SAM3 segmenter with the first frame (skipped when sharing an
         # already-initialised segmenter, e.g. the decoupled SAM-H sub-tracker).
@@ -501,8 +484,7 @@ class FlatSAMTracker:
         Args:
             seg_mask: Segmentation mask (H, W) for current frame.
             hough_enabled: Whether Hough path is enabled for this frame.
-            frame: Current frame (H, W, C); used by ``method='register'`` for the
-                texture check that separates a pose from its silhouette aliases.
+            frame: Current frame (H, W, C); unused by the Hough estimator.
 
         Returns:
             Tuple ``(mask_H, n_mask_corr)`` where ``mask_H`` is ``None`` when
@@ -513,60 +495,6 @@ class FlatSAMTracker:
 
         if not hough_enabled:
             return None, 0
-
-        if self.cfg.hough.method == "register":
-            mask_H, n_ok = self._register_mask_h(seg_mask, frame)
-            if mask_H is not None:
-                return mask_H, n_ok
-            if not self.cfg.hough.align_fallback_hough:
-                return None, 0
-
-        # P3' direct alignment replaces the Hough pipeline when configured; the
-        # last-frame homography init is well inside the measured convergence
-        # basin (~20 px / 20 deg) for tracking-scale inter-frame motion.
-        if self.cfg.hough.method == "align":
-            from flatsam2.mask_align import align_mask_to_homography, template_boundary
-
-            # The template is fixed for the whole sequence: contour it once.
-            if self._align_boundary is None and self.state.init_mask is not None:
-                self._align_boundary = template_boundary(
-                    self.state.init_mask > 0, self.cfg.hough.align_n_boundary_points
-                )
-            with profiler.section("mask_H.align"):
-                align_H, n_ok, residual, n_iters, corner_cov = align_mask_to_homography(
-                    seg_mask,
-                    self.state.init_corners,
-                    self.state.last_homography,
-                    template_mask=self.state.init_mask,
-                    boundary=self._align_boundary,
-                    n_boundary_points=self.cfg.hough.align_n_boundary_points,
-                    max_iters=self.cfg.hough.align_max_iters,
-                    huber_delta_px=self.cfg.hough.align_huber_delta_px,
-                    step_tol_px=self.cfg.hough.align_step_tol_px,
-                    redetect_above_residual_px=(
-                        self.cfg.hough.align_residual_ok_px
-                        if self.cfg.hough.align_redetect_moments
-                        else None
-                    ),
-                )
-            accepted = (
-                align_H is not None
-                and residual <= self.cfg.hough.align_residual_ok_px
-                and _is_valid_homography(align_H)
-            )
-            self._maskh_telemetry.align_attempted = True
-            self._maskh_telemetry.align_accepted = bool(accepted)
-            self._maskh_telemetry.align_residual_px = (
-                float(residual) if align_H is not None else float("nan")
-            )
-            self._maskh_telemetry.align_n_ok = int(n_ok)
-            self._maskh_telemetry.align_iters = int(n_iters)
-            if accepted:
-                self._maskh_telemetry.source = _MASK_H_SOURCE_ALIGN
-                self._maskh_last_corner_cov = corner_cov
-                return align_H, n_ok
-            if not self.cfg.hough.align_fallback_hough:
-                return None, 0
 
         from flatsam2.hough_homography import mask_to_homography
 
@@ -588,97 +516,6 @@ class FlatSAMTracker:
         if mask_H is not None:
             self._maskh_telemetry.source = _MASK_H_SOURCE_HOUGH
         return mask_H, n_mask_corr
-
-    def _register_mask_h(
-        self,
-        seg_mask: np.ndarray,
-        frame: Optional[np.ndarray],
-    ) -> tuple[Optional[np.ndarray], int]:
-        """Quad-free propose/refine/verify registration of the template mask.
-
-        Unlike ``method='align'``, this does not depend on the last homography
-        being close: when the incumbent pose fails verification the second-moment
-        search re-proposes poses from the current mask alone. Measured on the
-        offline benchmark (``experiments/maskh_bench.py``, held-out split), that
-        is worth +8 to +15 points of P@15 over the Hough quad once the estimate
-        has been lost, at a cost of ~1.5 points while tracking is healthy.
-
-        Args:
-            seg_mask: Segmentation mask (H, W) for the current frame.
-            frame: Current frame (H, W, C), or None to run mask-only.
-
-        Returns:
-            ``(mask_H, n_ok)``; ``mask_H`` is None when registration failed or
-            scored below ``hough.register_min_score``.
-        """
-        from flatsam2.mask_register import (
-            RegisterConfig,
-            RegistrationTemplate,
-            register_mask,
-        )
-
-        cfg = RegisterConfig(
-            n_angles=self.cfg.hough.register_n_angles,
-            accept_score=self.cfg.hough.register_accept_score,
-            incumbent_margin=self.cfg.hough.register_incumbent_margin,
-            overlap_power=self.cfg.hough.register_overlap_power,
-            appearance_power=self.cfg.hough.register_appearance_power,
-            support_power=self.cfg.hough.register_support_power,
-            support_tau_px=self.cfg.hough.register_support_tau_px,
-            support_alias_only=self.cfg.hough.register_support_alias_only,
-            alias_shortcut=self.cfg.hough.register_alias_shortcut,
-            alias_recheck=self.cfg.hough.register_alias_recheck,
-            sweep_stop_score=self.cfg.hough.register_sweep_stop_score,
-            sdf_roi_margin=self.cfg.hough.register_sdf_roi_margin,
-            n_boundary_points=self.cfg.hough.align_n_boundary_points,
-            max_iters=self.cfg.hough.align_max_iters,
-            huber_delta_px=self.cfg.hough.align_huber_delta_px,
-            step_tol_px=self.cfg.hough.align_step_tol_px,
-        )
-        # The template is fixed for the whole sequence: build its context once.
-        if self._register_template is None:
-            self._register_template = RegistrationTemplate.build(
-                self.state.init_corners,
-                self.state.init_mask,
-                seg_mask.shape[:2],
-                cfg,
-                init_frame=self.state.init_frame,
-            )
-        if self._register_template is None:
-            return None, 0
-
-        extra_H = self._register_extra_H
-        self._register_extra_H = ()
-        matches = self._register_matches
-        self._register_matches = None
-        with profiler.section("mask_H.register"):
-            result = register_mask(
-                self._register_template,
-                seg_mask,
-                last_H=self.state.last_homography,
-                extra_H=extra_H,
-                cfg=cfg,
-                frame=frame,
-                matches=matches,
-            )
-
-        accepted = (
-            result.H is not None
-            and result.score >= self.cfg.hough.register_min_score
-            and _is_valid_homography(result.H)
-        )
-        self._maskh_telemetry.align_attempted = True
-        self._maskh_telemetry.align_accepted = bool(accepted)
-        self._maskh_telemetry.align_residual_px = float(result.residual_px)
-        self._maskh_telemetry.align_n_ok = int(result.n_ok)
-        self._maskh_telemetry.align_iters = int(result.n_solves)
-        self._maskh_telemetry.register_score = float(result.score)
-        self._maskh_telemetry.register_source = result.source
-        if not accepted:
-            return None, 0
-        self._maskh_telemetry.source = _MASK_H_SOURCE_REGISTER
-        self._maskh_last_corner_cov = result.corner_cov
-        return result.H, result.n_ok
 
     def _estimate_loma_H(
         self,

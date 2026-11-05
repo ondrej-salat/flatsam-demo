@@ -59,16 +59,9 @@ class HoughConfig(BaseModel):
         default=False,
         description="Enable the mask-based homography estimator (SAM-H branch)",
     )
-    method: Literal["hough", "align", "register"] = Field(
+    method: Literal["hough"] = Field(
         default="hough",
-        description=(
-            "Mask->H estimator: 'hough' = lines->quad pipeline (legacy); 'align' = "
-            "direct damped-GN mask alignment on the 4-point parameterization (P3'), "
-            "initialized from the last-frame homography; 'register' = quad-free "
-            "propose/refine/verify registration (flatsam2/mask_register.py), which "
-            "adds a stateless second-moment pose search and a texture-verified "
-            "choice among hypotheses, so it can recover from a lost pose"
-        ),
+        description="Mask->H estimator: 'hough' = lines->quad pipeline",
     )
     align_n_boundary_points: int = Field(
         default=150,

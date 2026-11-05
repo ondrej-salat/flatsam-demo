@@ -1,6 +1,5 @@
 import logging
 import traceback
-from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -82,6 +81,8 @@ class FlatSAMTracker:
                 loading the model twice (it is a stateless feature extractor).
         """
         self.cfg = config or TrackerConfig()
+        if self.cfg.algorithm not in _ALGORITHMS:
+            raise ValueError(f"algorithm={self.cfg.algorithm!r} is not part of this demo")
         self.fail_hard = fail_hard
 
         # Initialize SAM3 segmenter (or reuse an injected, shared one).
@@ -140,17 +141,6 @@ class FlatSAMTracker:
                 from flatsam2.hough_homography import DINOFeatureExtractor
 
                 self._dino = DINOFeatureExtractor()
-
-        # NN homography quality scorer (loaded lazily).
-        self._nn_scorer = None
-        if self.cfg.nn_scorer.enabled:
-            from flatsam2.nn.inference import NNHomographyScorer
-
-            self._nn_scorer = NNHomographyScorer(
-                str(Path(self.cfg.nn_scorer.checkpoint_path).expanduser()),
-                arch=self.cfg.nn_scorer.arch,
-                n_points=self.cfg.nn_scorer.n_points,
-            )
 
         # Independent SAM-H sub-tracker for the decoupled LoMa path. It runs the
         # full mask-H + symmetry chain exactly like a standalone
@@ -242,12 +232,6 @@ class FlatSAMTracker:
             from flatsam2.hough_homography import SymmetryState
 
             self.state.symmetry = SymmetryState()
-
-        # Build reference contour for NN scorer if enabled.
-        if self._nn_scorer is not None:
-            from flatsam2.homography_quality import ReferenceContour
-
-            self._nn_scorer.init_reference(ReferenceContour.build(init_mask))
 
         if (
             self.cfg.loma.enabled
@@ -726,43 +710,6 @@ class FlatSAMTracker:
         self._loma_last_corr_mask = corr_mask_u8
         self.segmenter.correct(corr_mask_u8)
         return True
-
-    def _score_homography(
-        self,
-        seg_mask: np.ndarray,
-        homography: Optional[np.ndarray],
-        image_shape: tuple[int, int],
-    ) -> tuple[float, float]:
-        """Score candidate homography with NN scorer.
-
-        Args:
-            seg_mask: Segmentation mask (H, W) for current frame.
-            homography: Candidate homography (3, 3) or ``None``.
-            image_shape: Current image shape as ``(height, width)``.
-
-        Returns:
-            Tuple ``(rmse, sigma)`` in pixels. Returns ``(inf, inf)`` when the
-            candidate is missing.
-        """
-        if self._nn_scorer is None or homography is None:
-            return float("inf"), float("inf")
-        return self._nn_scorer.score(seg_mask, homography, image_shape)
-
-    def _select_best_candidate(
-        self,
-        candidates: list[ScoredCandidate],
-    ) -> Optional[ScoredCandidate]:
-        """Pick candidate with smallest predicted RMSE.
-
-        Args:
-            candidates: Candidate list to compare.
-
-        Returns:
-            Best candidate, or ``None`` when list is empty.
-        """
-        if not candidates:
-            return None
-        return min(candidates, key=lambda candidate: candidate.rmse)
 
     def _finalize_success(
         self,

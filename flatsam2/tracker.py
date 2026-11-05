@@ -22,7 +22,7 @@ from flatsam2.profiling import profiler
 # can import them without a circular dependency on this module. Re-exported here
 # (constants, dataclasses, pure helpers) to keep `from flatsam2.tracker import
 # TrackResult / _DEBUG_CANDIDATES / ...` working for existing callers.
-from flatsam2.tracking import corner_fusion, flow_hough, loma_samh, nn_cascade, nn_min_rmse
+from flatsam2.tracking import flow_hough, loma_samh
 from flatsam2.tracking.common import (
     _CANDIDATE_FLOW,
     _CANDIDATE_LAST_H,
@@ -56,10 +56,7 @@ logger = logging.getLogger(__name__)
 # dispatch point (looked up once per frame in step_with_mask).
 _ALGORITHMS = {
     "flow_hough": flow_hough.track,
-    "nn_min_rmse": nn_min_rmse.track,
-    "nn_cascade": nn_cascade.track,
     "loma_samh": loma_samh.track,
-    "corner_fusion": corner_fusion.track,
 }
 
 

@@ -5,7 +5,6 @@ description = "FlatSAM: a planar object tracker using SAM and ptlflow"
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
-authors = [ { name = "Jonas Serych" } ]
 dependencies = [
   # from modules
   "torch==2.7.1",

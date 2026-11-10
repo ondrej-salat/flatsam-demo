@@ -32,19 +32,8 @@ class DatasetInfo:
             ``'pot'`` → :func:`~flatsam2.datasets.pot_load_gt`,
             ``'pt'``  → :func:`~flatsam2.datasets.pt_load_gt`,
             ``'pti'`` → :func:`~flatsam2.datasets.pti_load_gt`
-            (requires an ``initfix_dir`` at call time),
-            ``'corners_txt'`` → :func:`~flatsam2.datasets.corners_txt_load_gt`
-            (POIC / TMT / UCSB, which share one annotation format and differ
-            only in where the frames and the annotations live — see
-            ``seq_subdir`` / ``gt_subdir``),
-            ``'mpot'`` → :func:`~flatsam2.datasets.mpot_load_gt` (MPOT-3K,
-            whose sequences hold several planar objects at once; one tracking
-            task is one ``<sequence>__<instance>`` pair).
+            (requires an ``initfix_dir`` at call time).
         uses_split: Whether this dataset supports train/test splits.
-        seq_subdir: Directory holding the per-sequence frame folders, relative
-            to the dataset root (``'corners_txt'`` only; ``''`` = the root).
-        gt_subdir: Directory holding the ``<sequence>.txt`` annotation files,
-            relative to the dataset root (``'corners_txt'`` only).
     """
 
     key: str
@@ -52,10 +41,8 @@ class DatasetInfo:
     label: str
     short_label: str
     base_dir_attr: str
-    gt_loader: Literal["pot", "pt", "pti", "corners_txt", "mpot"]
+    gt_loader: Literal["pot", "pt", "pti"]
     uses_split: bool
-    seq_subdir: str = ""
-    gt_subdir: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -88,48 +75,6 @@ _DATASET_DEFS: Tuple[DatasetInfo, ...] = (
         short_label="PTi",
         base_dir_attr="PT_BASE",
         gt_loader="pti",
-        uses_split=True,
-    ),
-    DatasetInfo(
-        key="poic",
-        aliases=(),
-        label="POIC",
-        short_label="POIC",
-        base_dir_attr="POIC_BASE",
-        gt_loader="corners_txt",
-        uses_split=False,
-        seq_subdir="sequences",
-        gt_subdir="gt",
-    ),
-    DatasetInfo(
-        key="tmt",
-        aliases=(),
-        label="TMT",
-        short_label="TMT",
-        base_dir_attr="TMT_BASE",
-        gt_loader="corners_txt",
-        uses_split=False,
-        seq_subdir="data/sequences",
-        gt_subdir="data/gt",
-    ),
-    DatasetInfo(
-        key="ucsb",
-        aliases=(),
-        label="UCSB",
-        short_label="UCSB",
-        base_dir_attr="UCSB_BASE",
-        gt_loader="corners_txt",
-        uses_split=False,
-        seq_subdir="",
-        gt_subdir="",
-    ),
-    DatasetInfo(
-        key="mpot",
-        aliases=("mpot-3k",),
-        label="MPOT-3K",
-        short_label="MPOT",
-        base_dir_attr="MPOT_BASE",
-        gt_loader="mpot",
         uses_split=True,
     ),
 )

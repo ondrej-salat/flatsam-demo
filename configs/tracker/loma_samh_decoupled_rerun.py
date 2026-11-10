@@ -2,10 +2,9 @@
 
 Identical to ``loma_samh`` except the entire SAM-H branch (mask-H + symmetry
 resolution) runs as a nested tracker that shares only the SAM3 mask stream. Its
-homography/symmetry chain is byte-identical to a standalone ``hough_symmetry_only``
-run; the LoMa inlier rule only picks per frame between the LoMa estimate and that
-independent SAM-H estimate, never feeding back. Reproduces the offline ensemble
-``LMr_allobj_infl10_X_SAM3H_thr35``.
+homography/symmetry chain is identical to a standalone SAM-H run; the LoMa inlier
+rule only picks per frame between the LoMa estimate and that independent SAM-H
+estimate, never feeding back.
 """
 
 import importlib.util

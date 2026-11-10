@@ -20,14 +20,7 @@ stop applying too. Six parameters out, one (``tau``) in.
 
 Deliberately unchanged: ``find_closest_H``, the zero-motion assumption that picks the
 candidate matching whose warped corners land nearest last frame's prediction. That
-selects geometry as well as labelling, so replacing it would confound two changes; it is
-a separate experiment.
-
-The point of running this beside ``corner_fusion_matchverify`` is that the *same* scalar
-resolves the same ambiguity in two structurally different trackers — in the quad-based one
-as a standalone namer replacing an appearance model, in the quad-free one folded into the
-verifier. If it holds in both, corner naming is a correspondence-support problem rather
-than a property of either architecture.
+selects geometry as well as labelling, not just the naming.
 
 Pre-RANSAC matches on purpose: inliers are selected under a homography that already
 carries one of the four namings, so scoring namings against them is circular.

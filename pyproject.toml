@@ -11,7 +11,7 @@ dependencies = [
   "torch==2.7.1",
   "torchvision==0.22.1",
   # "Triton==3.5.0",
-  "ptlflow @ git+https://github.com/serycjon/ptlflow@844b51e2a75e876823deeda53be7abf90e413178",
+  "ptlflow @ git+https://github.com/hmorimitsu/ptlflow@844b51e2a75e876823deeda53be7abf90e413178",
   "sam3 @ git+https://github.com/serycjon/sam3@0febedec6efe4cc622b0908b3788add56219b79c",
   "lomatch @ git+https://github.com/davnords/LoMa@8fb59c458f2a2ef44314f462467b229c27786bf0",
   # additional dependencies
@@ -23,8 +23,6 @@ dependencies = [
   "scipy",
   "scikit-image",
   "einops",
-  "fastapi",
-  "uvicorn",
 ]
 
 # Explicitly package only the source in `flatsam2/`

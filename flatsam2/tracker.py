@@ -1,6 +1,6 @@
 import logging
 import traceback
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import cv2
@@ -14,7 +14,6 @@ from flatsam2 import match_naming
 from flatsam2.config import LoMaPathConfig, TrackerConfig
 from flatsam2.datasets import warp_corners
 from flatsam2.geometry import warp_points
-from flatsam2.metrics import alignment_error
 from flatsam2.profiling import profiler
 
 # Shared verbs and types live in tracking.common so the per-algorithm modules
@@ -23,18 +22,14 @@ from flatsam2.profiling import profiler
 # TrackResult / _DEBUG_CANDIDATES / ...` working for existing callers.
 from flatsam2.tracking import flow_hough, loma_samh
 from flatsam2.tracking.common import (
-    _CANDIDATE_FLOW,
     _CANDIDATE_LAST_H,
     _CANDIDATE_LOMA,
     _CANDIDATE_MASK_H,
-    _CANDIDATE_REDETECTION_FLOW,
     _CANDIDATE_SAMH,
     _DEBUG_CANDIDATES,  # noqa: F401  re-exported for `from flatsam2.tracker import _DEBUG_CANDIDATES`
     _MASK_H_SOURCE_HOUGH,
-    CandidateScore,
     CorrectionTelemetry,
     MaskHTelemetry,
-    ScoredCandidate,
     TrackerDebugInfo,
     TrackerState,
     TrackResult,
@@ -109,16 +104,9 @@ class FlatSAMTracker:
         self._loma_last_selected = _CANDIDATE_LAST_H
         self._loma_last_corrected = False
         self._loma_last_corr_mask: Optional[np.ndarray] = None
-        # Per-corner (4, 2, 2) pixel covariance of the last loma_H / mask_H fit;
-        # None when unmeasurable (see flatsam2.corner_covariance).
-        self._loma_last_corner_cov: Optional[np.ndarray] = None
-        self._maskh_last_corner_cov: Optional[np.ndarray] = None
-        # Per-frame GT homography (init -> current) supplied by the runner for
-        # oracle correction experiments; None when GT is invalid or not plumbed.
-        self._oracle_H: Optional[np.ndarray] = None
         # Per-frame correction observables (survives step_with_mask crashes).
         self._corr_telemetry = CorrectionTelemetry()
-        # Per-frame mask-H estimator observables (align vs Hough acceptance).
+        # Per-frame mask-H observables (Hough availability, corner naming).
         self._maskh_telemetry = MaskHTelemetry()
         self._loma_last_matches: Optional[tuple] = None
         # Per-frame override for LoMa keypoint sampling (candidate-union densify).
@@ -143,11 +131,10 @@ class FlatSAMTracker:
                 self._dino = DINOFeatureExtractor()
 
         # Independent SAM-H sub-tracker for the decoupled LoMa path. It runs the
-        # full mask-H + symmetry chain exactly like a standalone
-        # ``hough_symmetry_only`` tracker, sharing only the SAM3 segmenter (and
-        # the stateless DINO extractor). The LoMa inlier rule then selects per
-        # frame between the LoMa estimate and this sub-tracker's estimate without
-        # ever feeding back, reproducing the offline ensemble.
+        # full mask-H + symmetry chain exactly like a standalone SAM-H tracker,
+        # sharing only the SAM3 segmenter (and the stateless DINO extractor). The
+        # LoMa inlier rule then selects per frame between the LoMa estimate and
+        # this sub-tracker's estimate without ever feeding back.
         self._samh_tracker = None
         if self.cfg.loma.enabled and self.cfg.loma.decouple_hough_state:
             samh_cfg = TrackerConfig(
@@ -208,8 +195,7 @@ class FlatSAMTracker:
         # Initialize with identity homography
         self.state.last_homography = np.eye(3, dtype=np.float64)
 
-        # Fresh per-run correction/oracle state.
-        self._oracle_H = None
+        # Fresh per-run correction state.
         self._corr_telemetry = CorrectionTelemetry()
         self._maskh_telemetry = MaskHTelemetry()
         self._loma_last_matches = None
@@ -281,11 +267,7 @@ class FlatSAMTracker:
 
         return mask
 
-    def track(
-        self,
-        frame: np.ndarray,
-        oracle_H: Optional[np.ndarray] = None,
-    ) -> TrackResult:
+    def track(self, frame: np.ndarray) -> TrackResult:
         """Update tracker with a new frame and return estimation.
 
         On any failure (e.g. singular matrix, too few inliers) the method falls
@@ -294,14 +276,10 @@ class FlatSAMTracker:
 
         Args:
             frame: (H, W, C) opencv uint8 BGR image
-            oracle_H: optional GT homography (3, 3) init frame -> current frame,
-                used by oracle correction experiments (``cfg.correction``
-                sources). None when GT is invalid/absent for this frame.
 
         Returns:
             TrackResult with the estimated homography and segmentation mask.
         """
-        self._oracle_H = oracle_H
         # Always run the segmenter first so its internal state stays up to date
         # and we have a mask regardless of whether homography estimation succeeds.
         with profiler.section("sam3"):
@@ -315,27 +293,6 @@ class FlatSAMTracker:
                 seg_mask = self.segmenter.track(frame)
                 self._loma_densify_mask = None
         return self.step_with_mask(frame, seg_mask)
-
-    def track_candidates(self, frame: np.ndarray) -> Tuple[np.ndarray, dict]:
-        """Run SAM3 on *frame* and return every candidate mask (no homography).
-
-        Segmentation-only path used by the candidate-mask dump (``candidate_dump``
-        config). It advances the SAM3 stream exactly like :meth:`track` but skips
-        all homography estimation, returning the raw multi-candidate output.
-
-        Args:
-            frame: (H, W, C) opencv uint8 BGR image.
-
-        Returns:
-            Tuple ``(mask, candidates)`` where ``mask`` is the (H, W) bool mask
-            SAM3 selected, and ``candidates`` is the dict from
-            ``SAM3StreamingTracker.track(..., return_all_masks=True)``:
-            ``{"masks": (M, H, W) bool, "logits": (M, H, W) float32,
-            "ious": (M,) float32}``. ``M`` is 3 under multimask output, 1
-            otherwise, and 0 when SAM3 reports the object absent.
-        """
-        with profiler.section("sam3"):
-            return self.segmenter.track(frame, return_all_masks=True)
 
     def step_with_mask(self, frame: np.ndarray, seg_mask: np.ndarray) -> TrackResult:
         """Run homography estimation for a frame whose SAM3 mask is already known.
@@ -461,21 +418,18 @@ class FlatSAMTracker:
         self,
         seg_mask: np.ndarray,
         hough_enabled: bool,
-        frame: Optional[np.ndarray] = None,
     ) -> tuple[Optional[np.ndarray], int]:
         """Compute mask-H and correspondence count from Hough pipeline.
 
         Args:
             seg_mask: Segmentation mask (H, W) for current frame.
             hough_enabled: Whether Hough path is enabled for this frame.
-            frame: Current frame (H, W, C); unused by the Hough estimator.
 
         Returns:
             Tuple ``(mask_H, n_mask_corr)`` where ``mask_H`` is ``None`` when
             unavailable.
         """
         self._maskh_telemetry = MaskHTelemetry()
-        self._maskh_last_corner_cov = None
 
         if not hough_enabled:
             return None, 0
@@ -513,11 +467,8 @@ class FlatSAMTracker:
             seg_mask: Current SAM mask `(H, W)`.
 
         Returns:
-            Tuple `(H, n_inliers)`, where `H` is None on failure. Also stashes
-            the per-corner covariance of the fit on ``self._loma_last_corner_cov``
-            (None on failure or when the fit is too degenerate to measure).
+            Tuple `(H, n_inliers)`, where `H` is None on failure.
         """
-        self._loma_last_corner_cov = None
         if self._loma is None or self._loma_feats0 is None:
             return None, 0
 
@@ -564,14 +515,6 @@ class FlatSAMTracker:
         n_inliers = int(inliers.sum()) if inliers is not None and H is not None else 0
         if not _is_valid_homography(H):
             return None, 0
-        if inliers is not None and self.state.init_corners is not None:
-            from flatsam2.corner_covariance import homography_corner_covs
-
-            inlier_mask = inliers.ravel().astype(bool)
-            corners = warp_corners(H, self.state.init_corners)
-            self._loma_last_corner_cov = homography_corner_covs(
-                pts_a[inlier_mask], pts_b[inlier_mask], self.state.init_corners, corners
-            )
         return H, n_inliers
 
     def _decoupled_select(
@@ -582,8 +525,7 @@ class FlatSAMTracker:
     ) -> np.ndarray:
         """Pick LoMa vs the independent SAM-H estimate by the inlier rule.
 
-        Mirrors the offline ensemble exactly: use LoMa when its inlier count
-        reaches ``inlier_threshold``, otherwise use the SAM-H sub-tracker's
+        Use LoMa when its inlier count reaches ``inlier_threshold``, otherwise use the SAM-H sub-tracker's
         estimate (which always has a result — it keeps its last homography on
         failure). Neither choice feeds back into the other chain.
 
@@ -608,7 +550,7 @@ class FlatSAMTracker:
         mask_H: Optional[np.ndarray],
         n_mask_corr: int,
     ) -> Optional[np.ndarray]:
-        """Choose LoMa or mask-H by offline ensemble inlier rule."""
+        """Choose LoMa or mask-H by the LoMa inlier rule."""
         if loma_H is not None and n_inliers >= self.cfg.loma.inlier_threshold:
             self._loma_last_selected = _CANDIDATE_LOMA
             return loma_H
@@ -629,12 +571,11 @@ class FlatSAMTracker:
     ) -> bool:
         """Apply SAM3 memory correction per ``cfg.correction``; record telemetry.
 
-        Source semantics (see :class:`CorrectionCfg`): the inlier gate applies to
-        a leg (trigger / content) iff that leg's source is ``"loma"``; oracle
-        legs require only a valid ``self._oracle_H`` this frame; ``"periodic"``
-        needs neither. A fired trigger with unavailable content abstains
-        (``trigger_fired=True, corrected=False``). ``dry_run`` records everything
-        but never touches SAM3 memory.
+        Both the trigger reference and the injected content are the LoMa-induced
+        mask, and both require the inlier gate; ``"periodic"`` skips the trigger
+        test but still needs that mask to inject. A fired trigger without it
+        abstains (``trigger_fired=True, corrected=False``). ``dry_run`` records
+        everything but never touches SAM3 memory.
 
         Args:
             seg_mask: Current SAM mask `(H, W)`.
@@ -649,57 +590,31 @@ class FlatSAMTracker:
             return False
         H_img, W_img = seg_mask.shape[:2]
 
-        # One induced mask per available source homography.
         loma_mask = None
         if loma_H is not None:
             loma_mask = (
                 cv2.warpPerspective(self.state.init_mask, loma_H, (W_img, H_img)) > 0
             )
-        gt_mask = None
-        if self._oracle_H is not None:
-            gt_mask = (
-                cv2.warpPerspective(self.state.init_mask, self._oracle_H, (W_img, H_img))
-                > 0
-            )
 
         # Always-on observables: independent of the inlier gate and of the
         # trigger outcome, so any trigger rule can be evaluated offline.
-        telemetry = _correction_telemetry(seg_mask, loma_mask, gt_mask, cfg)
-        if (
-            loma_H is not None
-            and self._oracle_H is not None
-            and self.state.init_corners is not None
-        ):
-            telemetry.loma_gt_err = float(
-                alignment_error(
-                    warp_corners(self._oracle_H, self.state.init_corners),
-                    warp_corners(loma_H, self.state.init_corners),
-                )
-            )
+        telemetry = _correction_telemetry(seg_mask, loma_mask, cfg)
         self._corr_telemetry = telemetry
 
-        # Per-leg source resolution; a "loma" leg additionally requires the
-        # inlier gate, an "oracle" leg only a valid GT homography this frame.
         loma_confident = loma_mask is not None and n_inliers >= cfg.inlier_threshold
         confident_loma_mask = loma_mask if loma_confident else None
-        trigger_mask = (
-            confident_loma_mask if cfg.trigger_source == "loma" else gt_mask
-        )
-        content_mask = (
-            confident_loma_mask if cfg.content_source == "loma" else gt_mask
-        )
 
         if cfg.trigger == "periodic":
             fired = self.state.frame_idx % cfg.period == 0
         else:
-            fired = trigger_mask is not None and _should_correct(
-                seg_mask, trigger_mask, cfg
+            fired = confident_loma_mask is not None and _should_correct(
+                seg_mask, confident_loma_mask, cfg
             )
         telemetry.trigger_fired = bool(fired)
-        if not fired or content_mask is None or cfg.dry_run:
+        if not fired or confident_loma_mask is None or cfg.dry_run:
             return False
 
-        corr_mask_u8 = content_mask.astype(np.uint8)
+        corr_mask_u8 = confident_loma_mask.astype(np.uint8)
         # Record the correction on self BEFORE the side-effect. segmenter.correct
         # mutates SAM3 memory; if it (or anything after) raises, step_with_mask
         # swallows the exception and the caller's `_loma_last_corrected = ...`
@@ -795,15 +710,13 @@ class FlatSAMTracker:
                 *(self._loma_last_matches or (None, None)),
                 tau_px=self.cfg.symmetry.match_tau_px,
             )
-            # Record what it saw and did, so a null grid result can be read as
-            # "fired and did not help" rather than "silently never ran".
+            # Record what it saw and did, so "fired and did not help" can be
+            # told apart from "silently never ran".
             self._maskh_telemetry.naming_shift = int(shift)
             self._maskh_telemetry.naming_support = support
             # Per-naming residual histograms, so `tau` can be re-tested offline
             # without re-running the tracker: the truncated-quadratic support is
             # recoverable in closed form for any tau on a bin edge (30 is one).
-            # Only the registrar path recorded these before, which left the
-            # deployed `hough` path's one free parameter unablatable.
             if matches is not None and matches[0] is not None:
                 _, counts, sum_sq = match_naming.alias_supports(
                     warp_corners(H, self.state.init_corners),

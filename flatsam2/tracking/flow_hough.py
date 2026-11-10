@@ -1,17 +1,15 @@
-"""Flow + Hough tracking algorithm (no NN scorer, no LoMa).
+"""Flow + Hough tracking algorithm (no LoMa).
 
-Sequential fallback chain for the ``flow_hough`` configs (``fast_kitti``,
-``flow_hough*``, ``hough_symmetry_only*``):
+Sequential fallback chain for ``algorithm='flow_hough'`` (``loma.enabled=False``):
 
 1. ``flow_H`` estimated with the last-good-H prewarp (primary path).
 2. ``redetection_flow_H`` estimated with the ``mask_H`` prewarp (re-detection
    assisted), when Hough is enabled and produced corner correspondences.
 3. ``mask_H`` directly (pure re-detection), when ``fallback_to_mask_H``.
 
-On exhaustion the last good homography is kept. This is the byte-identical
-inlining of the old ``_track_impl`` flow path plus ``_track_without_nn``; the
-verbs (``_compute_mask_h``, ``_estimate_flow_H``, ``_finalize_*``) stay methods
-on the tracker until the later refactor steps.
+On exhaustion the last good homography is kept. The verbs
+(``_compute_mask_h``, ``_estimate_flow_H``, ``_finalize_*``) are methods on the
+tracker.
 """
 
 from __future__ import annotations
@@ -55,7 +53,7 @@ def track(
     hough_enabled = trk.cfg.hough.enabled and trk.state.init_corners is not None
 
     # Mask-H computation (cheap, always ready as a fallback).
-    mask_H, n_mask_corr = trk._compute_mask_h(seg_mask, hough_enabled, frame)
+    mask_H, n_mask_corr = trk._compute_mask_h(seg_mask, hough_enabled)
 
     # Step 1: flow with the last-good-H prewarp (primary path).
     last_H = trk.state.last_homography

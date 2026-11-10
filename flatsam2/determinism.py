@@ -9,8 +9,8 @@ Two tiers, split by runtime cost:
 - :func:`set_global_determinism` adds the *costly* knobs on top: cuDNN
   deterministic mode (disables the autotuner), deterministic torch algorithms,
   and a fixed cuBLAS workspace. These can slow conv/GEMM-heavy nets, so they stay
-  opt-in (``run.py --deterministic``), used by the golden-output verification
-  harness (see ``LINEAR_REFACTOR.md``) to shrink run-to-run variance.
+  opt-in (``run.py --deterministic``), for comparing outputs across runs with
+  minimal run-to-run variance.
 
 Residual non-determinism: SAM3, ptlflow, and DINOv2 are GPU neural nets. Some CUDA
 kernels lack deterministic implementations; with ``warn_only=True`` they keep their

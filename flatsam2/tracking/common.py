@@ -25,12 +25,9 @@ _CANDIDATE_REDETECTION_FLOW = "redetection_flow_H"
 _CANDIDATE_LAST_H = "last_H"
 _CANDIDATE_LOMA = "loma_H"
 _CANDIDATE_SAMH = "samh_H"
-_CANDIDATE_FUSED = "fused_H"
 
 # Estimator that produced mask-H on a frame (see MaskHTelemetry.source).
-_MASK_H_SOURCE_ALIGN = "align"
 _MASK_H_SOURCE_HOUGH = "hough"
-_MASK_H_SOURCE_REGISTER = "register"
 _MASK_H_SOURCE_NONE = "none"
 
 # Ordered superset of candidate homography sources captured in debug output.
@@ -41,7 +38,6 @@ _DEBUG_CANDIDATES = (
     "mask_H",
     "loma_H",
     "samh_H",
-    "fused_H",
 )
 
 
@@ -109,9 +105,9 @@ def _union_candidate_masks(candidates: dict, fallback: np.ndarray) -> np.ndarray
 class CorrectionTelemetry:
     """Always-on per-frame correction observables; NaN when a source is unavailable.
 
-    Computed whenever ``cfg.correction.enabled`` (live, oracle, and dry-run
-    configs alike), independent of the inlier gate and of the trigger outcome,
-    so any trigger rule can be evaluated offline from a single run.
+    Computed whenever ``cfg.correction.enabled`` (live and dry-run configs
+    alike), independent of the inlier gate and of the trigger outcome, so any
+    trigger rule can be evaluated offline from a single run.
 
     Attributes:
         spill_loma: ``(loma_mask & ~sam) / area(loma_mask)`` — the superset-guard
@@ -119,25 +115,14 @@ class CorrectionTelemetry:
         excess_loma: ``dout`` at ``cfg.excess_depth_px`` vs the LoMa-induced mask
             (fraction of SAM area lying more than T px past its boundary).
         area_ratio_loma: ``area(sam) / area(loma_mask)``.
-        spill_gt: Same as ``spill_loma`` vs the GT-induced mask.
-        excess_gt: Same as ``excess_loma`` vs the GT-induced mask.
-        area_ratio_gt: Same as ``area_ratio_loma`` vs the GT-induced mask.
-        iou_gt: ``IoU(sam_mask, gt_mask)`` — direct segmentation-quality signal.
-        loma_gt_err: Corner alignment error (px) of ``loma_H`` vs ``H_gt``
-            (filled by the tracker; needs init corners).
         trigger_fired: Trigger condition held this frame, before the
             content-availability check — ``trigger_fired & ~corrected`` marks an
-            oracle-content abstain (or a dry run).
+            abstain (or a dry run).
     """
 
     spill_loma: float = float("nan")
     excess_loma: float = float("nan")
     area_ratio_loma: float = float("nan")
-    spill_gt: float = float("nan")
-    excess_gt: float = float("nan")
-    area_ratio_gt: float = float("nan")
-    iou_gt: float = float("nan")
-    loma_gt_err: float = float("nan")
     trigger_fired: bool = False
 
 
@@ -170,34 +155,24 @@ def _reference_mask_features(
 def _correction_telemetry(
     sam_mask: np.ndarray,
     loma_mask: Optional[np.ndarray],
-    gt_mask: Optional[np.ndarray],
     cfg: CorrectionCfg,
 ) -> CorrectionTelemetry:
-    """Fill the per-frame correction observables from whichever masks exist.
+    """Fill the per-frame correction observables when the LoMa mask exists.
 
     Args:
         sam_mask: Current SAM mask `(H, W)` (any truthy dtype).
         loma_mask: LoMa-induced mask `(H, W)` bool, or None when loma_H invalid.
-        gt_mask: GT-induced mask `(H, W)` bool, or None when GT unavailable.
         cfg: Correction config (supplies ``excess_depth_px``).
 
     Returns:
-        CorrectionTelemetry with the available fields set (``loma_gt_err`` and
-        ``trigger_fired`` are the caller's responsibility).
+        CorrectionTelemetry with the available fields set (``trigger_fired`` is
+        the caller's responsibility).
     """
-    sam = sam_mask > 0
     telemetry = CorrectionTelemetry()
     if loma_mask is not None:
         telemetry.spill_loma, telemetry.excess_loma, telemetry.area_ratio_loma = (
-            _reference_mask_features(sam, loma_mask, cfg.excess_depth_px)
+            _reference_mask_features(sam_mask > 0, loma_mask, cfg.excess_depth_px)
         )
-    if gt_mask is not None:
-        telemetry.spill_gt, telemetry.excess_gt, telemetry.area_ratio_gt = (
-            _reference_mask_features(sam, gt_mask, cfg.excess_depth_px)
-        )
-        union = int((sam | gt_mask).sum())
-        if union > 0:
-            telemetry.iou_gt = float(int((sam & gt_mask).sum()) / union)
     return telemetry
 
 
@@ -242,48 +217,22 @@ def _should_correct(
 
 @dataclass
 class CandidateScore:
-    """One homography candidate and its optional NN score.
+    """One homography candidate.
 
     Attributes:
         H: Homography (3, 3), or None if this candidate was not computed.
-        rmse: Predicted RMSE in pixels; ``inf`` when not scored.
-        sigma: Predicted uncertainty in pixels; ``inf`` when not scored.
     """
 
     H: Optional[np.ndarray] = None
-    rmse: float = float("inf")
-    sigma: float = float("inf")
 
 
 @dataclass
 class MaskHTelemetry:
-    """Which estimator actually produced mask-H on this frame, and how well.
-
-    Records the ``hough.method='align'`` acceptance decision so a run can be
-    checked for branch usage: an align-method run that silently falls back to
-    the Hough quad on most frames is not evidence about mask alignment. The
-    residual doubles as a per-frame branch-quality feature for selector studies.
+    """Whether mask-H was produced on this frame, and how its corners were named.
 
     Attributes:
-        source: Estimator whose homography was returned — ``'align'``,
-            ``'register'``, ``'hough'``, or ``'none'`` (mask-H unavailable this
-            frame). The ``align_*`` fields below are shared by both direct
-            mask estimators (``'align'`` and ``'register'``), so existing
-            branch-usage readouts keep working across the two.
-        align_attempted: Whether the aligner ran (i.e. ``method='align'``).
-        align_accepted: Whether the aligner's result passed residual + validity.
-        align_residual_px: Median boundary residual (px) from the aligner;
-            NaN when it did not run or returned no homography.
-        align_n_ok: Boundary sample count backing the aligner fit; -1 when N/A.
-        align_iters: Gauss-Newton iterations actually spent; equal to the
-            configured cap means the frame paid full price without converging.
-            -1 when the aligner did not run. For ``'register'`` this counts
-            Gauss-Newton solves rather than iterations, its cost unit.
-        register_score: Verified score of the accepted registration hypothesis
-            (NaN when the register method did not run). Monotone in accuracy —
-            usable directly as a per-frame confidence.
-        register_source: Which proposal won — ``'last'`` (the incumbent pose)
-            or ``'moment'`` (the stateless search recovered it).
+        source: ``'hough'`` when the Hough quad produced mask-H, ``'none'`` when
+            mask-H was unavailable this frame.
         naming_support: (4,) correspondence support of the four cyclic namings
             of the returned pose, in effective matches
             (``flatsam2.match_naming``). NaN when it was not measured.
@@ -303,13 +252,6 @@ class MaskHTelemetry:
     """
 
     source: str = _MASK_H_SOURCE_NONE
-    align_attempted: bool = False
-    align_accepted: bool = False
-    align_residual_px: float = float("nan")
-    align_n_ok: int = -1
-    align_iters: int = -1
-    register_score: float = float("nan")
-    register_source: str = ""
     naming_support: Optional[np.ndarray] = None
     naming_n_matches: int = -1
     naming_shift: int = -1
@@ -318,56 +260,13 @@ class MaskHTelemetry:
 
 
 @dataclass
-class FusionTelemetry:
-    """Per-frame corner-fusion observables (``corner_fusion`` algorithm only).
-
-    One entry per corner (order matches ``init_corners`` columns). A corner is
-    ``'fused'`` when both branches had a usable covariance and agreed within
-    ``disagreement_gate`` (precision-weighted average); ``'gated_confident'``
-    when they disagreed beyond that (the more confident branch wins outright,
-    no blending — averaging two things that disagree by more than their
-    stated uncertainty would just move the answer toward whichever is wrong);
-    ``'*_only'``/``'*_only_cov'`` when only one branch had data; ``'coast'``
-    when neither did.
-
-    Attributes:
-        modes: 4-tuple of per-corner mode labels.
-        max_disagreement: Largest per-corner squared Mahalanobis disagreement
-            among corners where both covariances were usable; NaN when none
-            were. Under a correct, calibrated model this is chi-square(2);
-            deployed sanity check, not itself the gate.
-        n_fused: Corners blended by precision-weighted average.
-        n_gated: Corners where disagreement exceeded the gate.
-        loma_cov: (4, 2, 2) per-corner covariance behind the LoMa branch this
-            frame, or None when unavailable. Raw (unfloored downstream of the
-            source estimator's own floor), for offline calibration checks
-            against GT — not itself used by the fusion decision beyond what
-            already went into ``modes``/``max_disagreement``.
-        samh_cov: Same, for the SAM-H branch.
-        mask_screened_occluded: True when the occlusion screen
-            (``cfg.fusion.occlusion_max_recall``) judged this frame's SAM mask
-            a clean partial view and made the mask branch abstain, so its
-            corners never reached the decision above. Always False when the
-            screen is disabled.
-    """
-
-    modes: tuple = ("coast", "coast", "coast", "coast")
-    max_disagreement: float = float("nan")
-    n_fused: int = 0
-    n_gated: int = 0
-    loma_cov: Optional[np.ndarray] = None
-    samh_cov: Optional[np.ndarray] = None
-    mask_screened_occluded: bool = False
-
-
-@dataclass
 class TrackerDebugInfo:
     """Universal per-frame tracker telemetry for visualization and analysis.
 
-    Populated by every tracking path (not just the NN scorer), so a single
-    ``{seq}_debug.npz`` captures candidate homographies, the selected source,
-    LoMa inlier counts, and SAM3 correction events. Fields a given path does not
-    produce keep their empty defaults (``H=None``, ``rmse``/``sigma``=inf).
+    Populated by every tracking path, so a single ``{seq}_debug.npz`` captures
+    candidate homographies, the selected source, LoMa inlier counts, and SAM3
+    correction events. Fields a given path does not produce keep their empty
+    defaults (``H=None``).
 
     Attributes:
         flow_H: Flow-H estimated with last-H prewarp.
@@ -375,18 +274,15 @@ class TrackerDebugInfo:
         mask_H: ``mask_H`` from the Hough pipeline.
         loma_H: LoMa keypoint homography (online LoMa path).
         samh_H: Independent SAM-H sub-tracker homography (decoupled LoMa path).
-        fused_H: Per-corner covariance-fused homography (``corner_fusion``
-            algorithm only).
         selected: Label of the candidate actually used, e.g. ``'flow_H'``,
-            ``'mask_H'``, ``'loma_H'``, ``'samh_H'``, ``'fused_H'``, ``'last_H'``.
+            ``'mask_H'``, ``'loma_H'``, ``'samh_H'``, ``'last_H'``.
         corrected: Whether a SAM3 self-correction fired on this frame.
         n_inliers: LoMa RANSAC inlier count this frame; ``-1`` when N/A.
         correction: Always-on correction observables (NaN defaults when the
             correction machinery did not run).
-        mask_h: Which estimator produced mask-H (align vs Hough quad) and its
-            acceptance observables. In the decoupled LoMa path this mirrors the
-            SAM-H sub-tracker's decision, since that is where mask-H is computed.
-        fusion: Per-corner fusion observables (``corner_fusion`` algorithm only).
+        mask_h: Whether mask-H was produced and how its corners were named. In
+            the decoupled LoMa path this mirrors the SAM-H sub-tracker, since
+            that is where mask-H is computed.
     """
 
     flow_H: CandidateScore = field(default_factory=CandidateScore)
@@ -394,13 +290,11 @@ class TrackerDebugInfo:
     mask_H: CandidateScore = field(default_factory=CandidateScore)
     loma_H: CandidateScore = field(default_factory=CandidateScore)
     samh_H: CandidateScore = field(default_factory=CandidateScore)
-    fused_H: CandidateScore = field(default_factory=CandidateScore)
     selected: str = _CANDIDATE_LAST_H
     corrected: bool = False
     n_inliers: int = -1
     correction: CorrectionTelemetry = field(default_factory=CorrectionTelemetry)
     mask_h: MaskHTelemetry = field(default_factory=MaskHTelemetry)
-    fusion: FusionTelemetry = field(default_factory=FusionTelemetry)
 
 
 @dataclass
@@ -433,18 +327,3 @@ class TrackerState:
 
     # Symmetry resolution state (only used when symmetry is enabled).
     symmetry: Optional[object] = None  # SymmetryState from hough_homography
-
-
-@dataclass
-class ScoredCandidate:
-    """Runtime helper for candidate selection.
-
-    Attributes:
-        label: Candidate label used in debug output.
-        homography: Candidate homography (3, 3).
-        rmse: Predicted RMSE in pixels.
-    """
-
-    label: str
-    homography: np.ndarray
-    rmse: float

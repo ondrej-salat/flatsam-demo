@@ -3,9 +3,8 @@
 A silhouette determines a planar pose only up to which corner is called first:
 the four cyclic relabelings of a quadrilateral describe the same outline, score
 the same raster overlap, and are indistinguishable to anything that looks only
-at shape. Measured on PlanarTrack, 44.6% of the mask registrar's wrong
-hypotheses are exactly that permutation, and a wrong one scored IoU 0.94 while
-being 219 px out.
+at shape. A wrongly named pose can overlap the object almost perfectly while
+its corners are far from the truth.
 
 Texture breaks the tie, and the keypoint matcher has already computed the
 texture evidence: a set of correspondences between the template image and the
@@ -35,11 +34,8 @@ were selected under a homography that already carries one of the four namings,
 so scoring namings against them is circular; raw matches are naming-independent
 evidence.
 
-Used in two places, with the same scalar: the quad-free registrar multiplies
-``U/N`` into its verification score (so the alias with the best correspondence
-support wins, IoU being tied across aliases by construction), and the
-quad-based tracker uses :func:`name_by_match_support` as a standalone namer in
-place of the DINO appearance vote.
+The tracker uses :func:`name_by_match_support` as a standalone namer in place
+of the DINO appearance vote (``symmetry.method='matches'``).
 """
 
 from __future__ import annotations

@@ -13,10 +13,9 @@ For ``loma_samh*`` configs. Two sub-variants, selected by
   runs only when mask-H was selected (a keypoint winner is already oriented, N4).
 
 Optional SAM3 self-correction (``cfg.correction.enabled``) fires inline in both
-sub-variants. Byte-identical inlining of the old ``_track_impl`` LoMa branch plus
-``_track_loma_decoupled``; the verbs (``_compute_mask_h``, ``_estimate_loma_H``,
+sub-variants. The verbs (``_compute_mask_h``, ``_estimate_loma_H``,
 ``_choose_loma_or_mask``, ``_decoupled_select``, ``_maybe_correct_sam3``,
-``_finalize_*``) stay methods on the tracker until the later refactor steps.
+``_finalize_*``) are methods on the tracker.
 """
 
 from __future__ import annotations
@@ -73,8 +72,7 @@ def track(
     if loma_active and trk._samh_tracker is not None:
         # When the sub-tracker resolves its cyclic corner ambiguity from the
         # keypoint correspondences, those have to exist before it runs, so LoMa
-        # moves ahead of it. Same reordering the keypoint proposal makes in
-        # corner_fusion, and like it, only when the option is on.
+        # moves ahead of it (only when symmetry.method='matches').
         name_from_matches = (
             trk._samh_tracker.cfg.symmetry.enabled
             and trk._samh_tracker.cfg.symmetry.method == "matches"
@@ -103,8 +101,8 @@ def track(
             corrected=trk._loma_last_corrected,
             n_inliers=n_inliers,
             correction=trk._corr_telemetry,
-            # mask-H is computed inside the sub-tracker, so its estimator
-            # decision (align vs Hough quad) lives on that instance.
+            # mask-H is computed inside the sub-tracker, so its telemetry lives
+            # on that instance.
             mask_h=trk._samh_tracker._maskh_telemetry,
         )
         return TrackResult(
@@ -115,7 +113,7 @@ def track(
         )
 
     # --- Mask-H computation (cheap, always ready as a fallback) -------------
-    mask_H, n_mask_corr = trk._compute_mask_h(seg_mask, hough_enabled, frame)
+    mask_H, n_mask_corr = trk._compute_mask_h(seg_mask, hough_enabled)
 
     # --- Coupled LoMa: pick LoMa vs mask-H on the shared state -------------
     if loma_active:
@@ -154,6 +152,6 @@ def track(
         )
 
     # Unreachable for a properly-initialised loma config (loma_active is always
-    # True once init() has run). Preserve the pre-refactor fallback — the plain
-    # flow + Hough chain — rather than returning nothing.
+    # True once init() has run). Fall back to the plain flow + Hough chain rather
+    # than returning nothing.
     return flow_hough.track(trk, frame, seg_mask)

@@ -5,7 +5,6 @@ Produces a video for a given sequence with tracking overlays.
 from pathlib import Path
 from typing import Optional
 import argparse
-import os
 import numpy as np
 import cv2
 from einops import rearrange
@@ -245,7 +244,7 @@ def main(argv=None):
                         help="Overlay the run's saved SAM3 masks (--no-draw-masks to hide)")
     parser.add_argument('--compare', type=Path,
                         help="Dir with another tracker's <seq>.txt to overlay, "
-                             "e.g. <results>/woftsam_samfallback_nl/UCSB")
+                             "e.g. <results>/<other_config>/POT-210")
 
     args = parser.parse_args(argv)
 

@@ -9,15 +9,11 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from einops import rearrange
 
-from flatsam2.config_aliases import (
-    get_config_display_name,
-    load_config_aliases_from_file,
-)
 from flatsam2.config import compute_output_dir
 from flatsam2.datasets import (
     CLI_CHOICES,
@@ -40,23 +36,6 @@ def load_predictions(results_dir: Path, seq_name: str) -> np.ndarray:
         pred_flat, "frames (corners xy) -> frames xy corners", corners=4, xy=2
     )
     return pred
-
-
-def print_sequence_results(seq_name: str, results: Dict) -> None:
-    print(f"\n{seq_name}:")
-    print(f"  Valid frames: {results['num_valid']}")
-    print(f"  Mean error: {results['mean_error']:.2f} px")
-    print(f"  Median error: {results['median_error']:.2f} px")
-    print(f"  P@5:  {results['p@5']:.1f}%")
-    print(f"  P@10: {results['p@10']:.1f}%")
-    print(f"  P@15: {results['p@15']:.1f}%")
-    if "br_mean_error" in results:
-        print(f"  Best Rotation:")
-        print(f"    Mean error: {results['br_mean_error']:.2f} px")
-        print(f"    Median error: {results['br_median_error']:.2f} px")
-        print(f"    P@5:  {results['br_p@5']:.1f}%")
-        print(f"    P@10: {results['br_p@10']:.1f}%")
-        print(f"    P@15: {results['br_p@15']:.1f}%")
 
 
 def print_aggregate_results(
@@ -95,107 +74,6 @@ def print_aggregate_results(
     )
 
 
-def compute_attribute_aggregates(
-    sequence_results: List[Dict],
-    annotation_file: Path,
-) -> Dict[str, Dict]:
-    """Compute aggregate metrics stratified by sequence-level binary attributes.
-
-    Args:
-        sequence_results: Per-sequence results dicts (must have 'sequence' key and 'errors' array).
-        annotation_file: Path to annotation JSON produced by planartrack_sequence_annotator.py.
-
-    Returns:
-        Dict mapping attribute name -> {
-            "num_with": int,
-            "num_without": int,
-            "with": {"p@5": float, "p@15": float},   # present only when num_with > 0
-            "without": {"p@5": float, "p@15": float}, # present only when num_without > 0
-        }
-    """
-    annotation_data = json.loads(annotation_file.read_text(encoding="utf-8"))
-    annotations: Dict[str, Dict[str, bool]] = annotation_data.get("annotations", {})
-    attributes: List[str] = annotation_data.get("attributes", [])
-
-    result: Dict[str, Dict] = {}
-    for attr in attributes:
-        with_attr = [
-            r for r in sequence_results
-            if bool(annotations.get(r["sequence"], {}).get(attr, False))
-        ]
-        without_attr = [
-            r for r in sequence_results
-            if not bool(annotations.get(r["sequence"], {}).get(attr, False))
-        ]
-
-        entry: Dict = {
-            "num_with": len(with_attr),
-            "num_without": len(without_attr),
-        }
-        if with_attr:
-            agg = aggregate_results(with_attr)
-            entry["with"] = {
-                "p@5": float(agg["overall_p@5"]),
-                "p@15": float(agg["overall_p@15"]),
-                "num_sequences": len(with_attr),
-            }
-        if without_attr:
-            agg = aggregate_results(without_attr)
-            entry["without"] = {
-                "p@5": float(agg["overall_p@5"]),
-                "p@15": float(agg["overall_p@15"]),
-                "num_sequences": len(without_attr),
-            }
-
-        result[attr] = entry
-
-    return result
-
-
-def print_attribute_aggregates(attr_aggregates: Dict[str, Dict]) -> None:
-    """Print per-attribute p@5/p@15 breakdown as an org-mode table.
-
-    Args:
-        attr_aggregates: Output of compute_attribute_aggregates().
-    """
-    if not attr_aggregates:
-        return
-
-    print("\nAttribute breakdown:")
-    headers = ["attribute", "group", "n", "p@5", "p@15"]
-    rows = []
-    for attr, entry in attr_aggregates.items():
-        for group in ("with", "without"):
-            if group in entry:
-                g = entry[group]
-                rows.append([attr, group, str(g["num_sequences"]),
-                              f"{g['p@5']:.1f}", f"{g['p@15']:.1f}"])
-
-    col_w = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            col_w[i] = max(col_w[i], len(cell))
-
-    def fmt_row(cells: List[str]) -> str:
-        parts = []
-        for i, (cell, w) in enumerate(zip(cells, col_w)):
-            if i <= 1:
-                parts.append(f" {cell:<{w}} ")
-            else:
-                parts.append(f" {cell:>{w}} ")
-        return "|" + "|".join(parts) + "|"
-
-    sep = "|-" + "-+-".join("-" * w for w in col_w) + "-|"
-    print(fmt_row(headers))
-    print(sep)
-    prev_attr = None
-    for row in rows:
-        if prev_attr is not None and row[0] != prev_attr:
-            print(sep)
-        print(fmt_row(row))
-        prev_attr = row[0]
-
-
 def evaluate_dataset(
     dataset: str,
     base_dir: Path,
@@ -205,15 +83,12 @@ def evaluate_dataset(
     output_file: Optional[Path] = None,
     config_path: Optional[Path] = None,
     initfix_dir: Optional[Path] = None,
-    config_aliases: Optional[Dict[str, str]] = None,
-    attributes_file: Optional[Path] = None,
     results_name: Optional[str] = None,
 ) -> Dict:
     ds_info = DATASETS[dataset]
     load_gt_fn = make_gt_loader(dataset, initfix_dir)
     # Results normally live under the config's stem; ``results_name`` names the
-    # directory directly, for runs whose directory is not a flatsam2 config
-    # (e.g. the legacy trackers driven by experiments/run_legacy.py --name).
+    # directory directly, for runs whose directory is not a flatsam2 config.
     if results_name is not None:
         results_dir = base_results_dir / results_name / ds_info.label
     else:
@@ -222,8 +97,7 @@ def evaluate_dataset(
     if output_file is None:
         output_file = results_dir / "eval_results.json"
 
-    config_name = results_name or (config_path.stem if config_path is not None else "default")
-    method_name = get_config_display_name(config_name, config_aliases or {})
+    method_name = results_name or (config_path.stem if config_path is not None else "default")
 
     print(f"Evaluating {len(sequences)} {ds_info.label} sequences")
     if split:
@@ -271,13 +145,6 @@ def evaluate_dataset(
             method_name=method_name,
         )
 
-        attr_aggregates: Optional[Dict] = None
-        if attributes_file is not None:
-            if not attributes_file.exists():
-                print(f"WARNING: attributes file not found, skipping: {attributes_file}")
-            else:
-                attr_aggregates = compute_attribute_aggregates(sequence_results, attributes_file)
-                print_attribute_aggregates(attr_aggregates)
 
         if output_file:
             output_data: Dict = {
@@ -298,8 +165,6 @@ def evaluate_dataset(
                     for res in sequence_results
                 ],
             }
-            if attr_aggregates is not None:
-                output_data["attribute_aggregates"] = attr_aggregates
             output_file.parent.mkdir(parents=True, exist_ok=True)
             with output_file.open("w") as f:
                 json.dump(output_data, f, indent=2)
@@ -331,11 +196,6 @@ def evaluate_dataset(
 
 
 def main(argv=None) -> int:
-    default_alias_config = Path("configs/aliases/default.py")
-    default_alias_config = (
-        default_alias_config if default_alias_config.exists() else None
-    )
-
     parser = argparse.ArgumentParser(
         description="Evaluate tracking results on POT-210 or PlanarTrack datasets"
     )
@@ -357,11 +217,11 @@ def main(argv=None) -> int:
         help="Specific sequences to evaluate (if not specified, evaluate all)",
     )
     parser.add_argument(
-        "--subset",
+        "--subset-file",
+        type=Path,
         help=(
-            "Name of a subset to load from configs/subsets/<name>.txt "
-            "(one sequence per line). If provided and --sequences is not given the "
-            "subset will be used. If both are provided the intersection will be used."
+            "Path to a subset file (one sequence name per line). Combined with "
+            "--sequences, the intersection is used."
         ),
     )
     parser.add_argument(
@@ -385,8 +245,7 @@ def main(argv=None) -> int:
         default=None,
         help=(
             "Name of the results sub-directory under --results-dir, used instead "
-            "of the config stem. For runs not produced by a flatsam2 config, e.g. "
-            "the legacy trackers (experiments/run_legacy.py)."
+            "of the config stem. For runs not produced by a flatsam2 config."
         ),
     )
     parser.add_argument(
@@ -396,25 +255,6 @@ def main(argv=None) -> int:
         help=(
             "Directory containing per-sequence initfix files for planartrack-initfix / pti "
             "(defaults to PT_INITFIX_DIR from path_config.py)"
-        ),
-    )
-    parser.add_argument(
-        "--alias-config",
-        type=Path,
-        default=default_alias_config,
-        help=(
-            "Python file defining config-name display aliases (expects 'aliases' "
-            "mapping). Defaults to configs/aliases/default.py when present."
-        ),
-    )
-    parser.add_argument(
-        "--attributes-file",
-        type=Path,
-        default=None,
-        help=(
-            "JSON file with sequence-level binary attributes produced by "
-            "planartrack_sequence_annotator.py. When provided, metrics are also "
-            "reported per attribute (sequences with / without each attribute)."
         ),
     )
     args = parser.parse_args(argv)
@@ -435,17 +275,11 @@ def main(argv=None) -> int:
         return 1
 
     try:
-        config_aliases = load_config_aliases_from_file(args.alias_config)
-    except Exception as e:
-        print(f"ERROR: Could not load alias config: {e}")
-        return 1
-
-    try:
         sequences = get_sequences(
             args.dataset,
             args.base_dir,
             sequences=args.sequences,
-            subset=args.subset,
+            subset_file=args.subset_file,
             split=args.split,
         )
     except ValueError as e:
@@ -461,8 +295,6 @@ def main(argv=None) -> int:
         args.output,
         args.config,
         initfix_dir=args.initfix_dir,
-        config_aliases=config_aliases,
-        attributes_file=args.attributes_file,
         results_name=args.results_name,
     )
     return 0
@@ -470,7 +302,5 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     # The aggregate is written even when sequences failed, so the exit status is
-    # the only signal that the JSON describes a partial grid. slurm/submit.py
-    # chains this with `afterok`; swallowing the status makes an incomplete
-    # evaluation look like a finished one.
+    # the only signal that the JSON describes a partial result.
     sys.exit(main())

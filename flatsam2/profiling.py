@@ -26,7 +26,7 @@ paths. A driver enables timing, wraps each frame, then prints a report::
 
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterator, List
 
 import torch

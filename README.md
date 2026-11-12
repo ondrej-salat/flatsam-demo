@@ -1,68 +1,50 @@
-# FlatSAM2 demo
+# FlatSAM: Segmentation-Focused Correspondences for Precise and Robust Planar Tracking
 
-Planar object tracker: give it a video and the 4 corners of a planar object (poster, book cover,
-screen, ...) in the first frame, and it tracks the object's homography through the video. It
-combines LoMa keypoint matching with SAM3 segmentation: a keypoint homography while there are
-enough matches, a homography from the SAM3 mask when there are not.
+## Abstract
+Planar tracking needs precise homographies even when the target is small, blurred, or has weak
+texture. Feature matching gives precise geometry, but a limited keypoint budget can be spent on the
+background. Segmentation captures target shape, but its corners have ambiguous ordering. We present
+FlatSAM, which combines an independently maintained keypoint tracker with a quadrilateral fitted to
+a shared SAM3 mask. It prioritises keypoints inside the target, estimates pose directly between the
+initial and current frames, and selects between keypoint and mask estimates using match support.
+The same matches assign the mask corners, without an additional appearance model. FlatSAM achieves
+88.0 p@15 on re-annotated PlanarTrack and 97.23 p@15 on POT-210. It leads on all five benchmarks.
+These results show how target-focused matching and mask-based geometry complement each other for
+planar tracking.
 
-## Requirements
+## Results
+| Method | Segmentation model | Geometry branch | POT-210 p@5 | POT-210 p@15 | PlanarTrack p@5 | PlanarTrack p@15 |
+|---|---|---|---:|---:|---:|---:|
+| SIFT | N/A | keypoints | 65.8 | 69.6 | 18.8 | 26.8 |
+| LISRD | N/A | keypoints | 68.3 | 79.2 | 23.5 | 37.3 |
+| HDN | N/A | regressed | 70.9 | 92.4 | 31.9 | 58.0 |
+| HVC-Net | N/A | regressed | 91.4 | 95.8 | 48.8 | 64.3 |
+| WOFT | N/A | flow | 90.0 | 95.4 | 48.9 | 65.9 |
+| SAM-H | SAM2 | Hough | 68.6 | 89.4 | 62.4 | 80.5 |
+| SAM-H, segmenter control | SAM3 | Hough | 70.9 | 90.3 | <ins>65.0</ins> | <ins>82.4</ins> |
+| WOFTSAM | SAM2 | flow+Hough | 91.9 | <ins>97.5</ins> | 57.4 | 77.6 |
+| WOFTSAM, segmenter control | SAM3 | flow+Hough | 92.1 | 97.2 | 58.3 | 79.2 |
+| keypoint branch only (ours) | SAM3 | keypoints | <ins>92.4</ins> | 97.3 | 56.7 | 78.2 |
+| **FlatSAM (ours)** | SAM3 | keypoints+Hough | **93.4** | **98.5** | **65.6** | **88.0** |
 
-- Linux x86_64, an NVIDIA GPU with ≥ 8 GB and a driver for CUDA 12.6 (≥ 560; not RTX 50xx)
-- git, curl or wget, internet, ~20 GB disk
-- No Python needed: `setup.sh` fetches Python 3.12 via [uv](https://docs.astral.sh/uv/) and installs
-  the pinned `requirements-lock.txt` into `venv/`
-- A Hugging Face account with access to the gated SAM3 weights: request it at
-  <https://huggingface.co/facebook/sam3>, then create a Read token at
-  <https://huggingface.co/settings/tokens>
+Pooled p@k (%) on the 1,004 changed-frame POT-210 protocol and re-annotated PlanarTrack. POT-210
+values follow WOFTSAM; PlanarTrack uses WOFTSAM's updated initial poses. SIFT, LISRD, and HDN are
+rescored released predictions (not reruns), with fallback on 236 degenerate frames. POT-210 uses
+WOFT's changed-frame labels; our PlanarTrack rows are evaluated predictions. SAM3 controls change
+only the segmenter.
 
-## Setup
-
+## Installation
 ```bash
-./setup.sh && source .envrc       # once; asks for the HF token (or set HF_TOKEN in .env)
+cd flatsam-demo
+
+./setup.sh
+
+source .envrc
 ```
 
-In every new shell: `source .envrc`. Settings (output and dataset paths) live in `.env`, created
-from `.env.example` on the first run.
+`setup.sh` needs a Hugging Face token with access to the gated [SAM3 weights](https://huggingface.co/facebook/sam3).
+Request access there, create a Read token at <https://huggingface.co/settings/tokens>, and paste it
+when `setup.sh` asks (or set `HF_TOKEN` in `.env`). Settings (dataset and output paths) live in
+`.env`, created from `.env.example` on the first run.
 
-## Run
-
-```bash
-python demo.py video clip.mp4 --corners x1 y1 x2 y2 x3 y3 x4 y4
-python demo.py dataset pot V01_7
-python demo.py params             # tunable keys; override any with --set key=value
-```
-
-- `video`: `--corners` are the object's corners in the first frame, in pixels, clockwise from
-  top-left. Writes `clip_tracked.mp4` next to the input.
-- `dataset`: tracks one POT-210 sequence, evaluates it and renders it. Expects
-  `data/POT-210/extracted/images/<seq>/*.jpg` and
-  `data/POT-210/annotation/WOFT_reannotation_coarse_onlychanged/<seq>_{gt_points,flag}.txt`
-  (paths in `.env`). Writes predictions and metrics to `results/` and a video to `vis/`.
-
-A 500-frame 1280×720 sequence takes ~3–5 min (A100 / RTX 4000 Ada).
-
-## Python API
-
-```python
-import numpy as np
-from flatsam2.config import load_config_from_file
-from flatsam2.datasets import warp_corners
-from flatsam2.tracker import FlatSAMTracker
-
-tracker = FlatSAMTracker(load_config_from_file("configs/tracker/loma_samh_matchnaming.py"))
-corners = np.array([[x1, x2, x3, x4],
-                    [y1, y2, y3, y4]], dtype=float)  # (2, 4), first frame
-tracker.init(first_frame, init_corners=corners)      # BGR uint8 (H, W, 3)
-for frame in frames:
-    H = tracker.track(frame).homography              # (3, 3), first frame -> this frame
-    current = warp_corners(H, corners)               # (2, 4)
-```
-
-## Metrics (`dataset` mode)
-
-- **Alignment error**: RMS distance over the 4 corners
-- **P@5 / P@15**: % of frames with alignment error ≤ 5 / 15 px
-
-## License
-
-MIT
+Tested on Linux x86_64 with Python 3.12 and CUDA 12.6, on NVIDIA A100 and RTX 4000 SFF Ada (20 GB) GPUs.
